@@ -1,0 +1,616 @@
+flowchart TD
+ subgraph EnterpriseOCP["Enterprise Cluster (Management / Tooling OCP)"]
+        HCP["HyperShift Operator"]
+        HCPPods["Hosted Control Plane Pods (API, Scheduler, etcd, etc.)"]
+        ArgoMgmt["ArgoCD - Platform Argo (Infra & Control Plane Deployments)"]
+        Keycloak["Keycloak (OIDC Auth, proxied to AD)"]
+        Vault["HashiCorp Vault (Secrets & Certs Mgmt)"]
+        Observability["Grafana / Loki / Mimir (Observability Stack)"]
+        DNS["CoreDNS / External DNS Integration"]
+        Network["OVN-Kubernetes / SDN / Load Balancers"]
+        StorageSAN["NetApp SAN (Block Storage)"]
+        StorageS3["NetApp S3 (Object Storage)"]
+  end
+ subgraph ProdDC1["Production Cluster - DC1 (Hosted Cluster)"]
+        ArgoApp1["ArgoCD - App Argo (Application Deployments)"]
+        Workers1["Worker Nodes (Apps, Microservices, Kubelet)"]
+        SDN1["OVN / SDN Networking"]
+  end
+ subgraph ProdDC2["Production Cluster - DC2 (Hosted Cluster)"]
+        ArgoApp2["ArgoCD - App Argo (Application Deployments)"]
+        Workers2["Worker Nodes (Apps, Microservices, Kubelet)"]
+        SDN2["OVN / SDN Networking"]
+  end
+ subgraph ExternalSystems["External Systems"]
+        Admin["Platform Administrator"]
+        Dev["Application Developer"]
+        AD["Active Directory (Enterprise Identity Source)"]
+        GitRepos["Git Repositories (Infra & App Manifests)"]
+  end
+    Admin -- Manages Cluster Infra --> ArgoMgmt
+    Dev -- Deploys Apps via GitOps --> ArgoApp1 & ArgoApp2
+    GitRepos -- Infra Manifests --> ArgoMgmt
+    GitRepos -- App Manifests --> ArgoApp1 & ArgoApp2
+    ArgoMgmt -- Deploys Hosted Control Planes --> HCP
+    HCP -- Creates HostedCluster CRs --> HCPPods
+    HCPPods -- Hosts Control Planes for --> ProdDC1 & ProdDC2
+    ArgoApp1 -- Deploys Workloads --> Workers1
+    ArgoApp2 -- Deploys Workloads --> Workers2
+    Keycloak -- Issues Tokens --> EnterpriseOCP
+    Keycloak -- Auth for ArgoCD Instances --> ArgoMgmt & ArgoApp1 & ArgoApp2
+    AD -- Federated Auth --> Keycloak
+    Vault -- Secrets / Certs --> HCPPods & ProdDC1 & ProdDC2
+    Observability -- Collects Metrics & Logs --> ProdDC1 & ProdDC2
+    DNS -- Cluster & External Name Resolution --> EnterpriseOCP
+    Network -- Connectivity Across Clusters & DCs --> EnterpriseOCP
+    StorageSAN -- "Persistent Volumes - Block Storage" --> EnterpriseOCP
+    StorageS3 -- "Object Storage - S3 Data" --> Observability
+    ProdDC1 -- Uses --> DNS & Network & StorageSAN & StorageS3
+    ProdDC2 -- Uses --> DNS & Network & StorageSAN & StorageS3
+     HCP:::enterprise
+     HCPPods:::enterprise
+     ArgoMgmt:::enterprise
+     Keycloak:::enterprise
+     Vault:::enterprise
+     Observability:::enterprise
+     DNS:::enterprise
+     Network:::enterprise
+     StorageSAN:::enterprise
+     StorageS3:::enterprise
+     ArgoApp1:::production
+     Workers1:::production
+     SDN1:::production
+     ArgoApp2:::production
+     Workers2:::production
+     SDN2:::production
+     Admin:::external
+     Dev:::external
+     AD:::external
+     GitRepos:::external
+     ProdDC1:::production
+     ProdDC2:::production
+     EnterpriseOCP:::enterprise
+    classDef external fill:#fff3e0,stroke:#f57c00,color:#000
+    classDef enterprise fill:#e3f2fd,stroke:#1976d2,color:#000
+    classDef production fill:#e8f5e9,stroke:#388e3c,color:#000
+    classDef infra fill:#ede7f6,stroke:#512da8,color:#000
+
+
+---
+
+| Layer                             | Component                          | Description                                                  |
+| --------------------------------- | ---------------------------------- | ------------------------------------------------------------ |
+| **Enterprise Cluster**            | **HyperShift Operator**            | Manages all hosted control planes for production clusters.   |
+|                                   | **ArgoCD (Platform Argo)**         | Manages infrastructure deployments across clusters.          |
+|                                   | **Keycloak (with AD)**             | Provides unified authentication (OIDC + RBAC).               |
+|                                   | **Vault**                          | Handles secrets, certificates, and encryption for clusters.  |
+|                                   | **Observability Stack**            | Collects logs/metrics from all clusters using NetApp S3.     |
+|                                   | **DNS**                            | Provides cluster and external zone name resolution.          |
+|                                   | **Network (OVN/SDN)**              | Handles cross-cluster communication and routing.             |
+|                                   | **NetApp SAN**                     | Provides block storage for persistent workloads (PVs, etcd). |
+|                                   | **NetApp S3**                      | Provides object storage for observability and backup.        |
+| **Production Clusters (DC1/DC2)** | **App ArgoCD**                     | Deploys business workloads in hosted clusters.               |
+|                                   | **Worker Nodes**                   | Run containerized apps and microservices.                    |
+|                                   | **SDN / OVN**                      | Local cluster networking.                                    |
+| **External**                      | **AD / Git Repos / Admins / Devs** | Users and integrations for identity and automation.          |
+
+
+
+---
+
+graph TD
+
+%% ===== Enterprise Cluster =====
+subgraph EnterpriseCluster["Enterprise OpenShift Cluster (Management / Tooling Layer)"]
+
+  %% --- Control Plane ---
+  subgraph ControlPlane["OCP Core Control Plane"]
+    APIServer["Kubernetes API Server"]
+    Scheduler["Scheduler"]
+    ControllerMgr["Controller Manager"]
+    Etcd["etcd (State Store, PV-backed via NetApp SAN)"]
+  end
+
+  %% --- HyperShift Management ---
+  subgraph HyperShift["HyperShift Management"]
+    HCP["HyperShift Operator"]
+    HC_CR["HostedCluster / NodePool CRDs"]
+    HCPPods["Hosted Control Plane Pods (for all Hosted Clusters)"]
+  end
+
+  %% --- Platform ArgoCD ---
+  subgraph ArgoCD["Platform ArgoCD"]
+    ArgoServer["ArgoCD Server (UI/API)"]
+    ArgoRepo["ArgoCD Repo Server (GitOps Sync)"]
+    ArgoController["ArgoCD Application Controller"]
+  end
+
+  %% --- Authentication Layer ---
+  subgraph Auth["Authentication"]
+    Keycloak["Keycloak (OIDC Provider)"]
+    AD["Active Directory (Upstream Identity Source)"]
+  end
+
+  %% --- Secrets Layer ---
+  subgraph Secrets["Secrets Management"]
+    Vault["HashiCorp Vault"]
+    VaultSecretsOperator["Vault Secrets Operator(Secrets to Pods)"]
+  end
+
+  %% --- Observability Layer ---
+  subgraph Observability["Observability Stack"]
+    Grafana["Grafana (Dashboards)"]
+    Loki["Loki (Logs, uses NetApp S3)"]
+    Mimir["Mimir (Metrics, uses NetApp S3)"]
+    Alloy["Alloy(Log Forwarding"]
+  end
+
+  %% --- Networking and DNS ---
+  subgraph Network["Networking & DNS"]
+    OVN["OVN-Kubernetes / SDN"]
+    DNS["CoreDNS / ExternalDNS"]
+    LB["Ingress Controllers / Load Balancers"]
+  end
+
+  %% --- Storage Layer ---
+  subgraph Storage["Storage (NetApp)"]
+    NetAppSAN["NetApp Trident CSI - SAN (Block PVs)"]
+    NetAppS3["NetApp S3 Gateway (Object Storage)"]
+  end
+
+end
+
+%% ===== Relationships =====
+
+%% Core Control Plane
+APIServer --> Scheduler
+APIServer --> ControllerMgr
+ControllerMgr --> Etcd
+
+%% HyperShift
+ArgoCD -->|Deploys HostedCluster CRs| HCP
+HCP -->|Manages Lifecycle| HC_CR
+HCP -->|Deploys Hosted Control Plane Pods| HCPPods
+HCPPods -->|Uses etcd PVs| NetAppSAN
+
+%% Authentication
+Keycloak -->|Federates Auth| AD
+APIServer -->|OIDC Auth| Keycloak
+ArgoServer -->|SSO via OIDC| Keycloak
+Vault -->|Auth via JWT/OIDC| Keycloak
+
+%% Secrets
+Vault -->|Injects Secrets| HCPPods
+VaultInjector -->|Sidecar Secrets Delivery| HCPPods
+Vault -->|Stores Certs / Tokens| NetAppSAN
+
+%% Observability
+Loki -->|Stores Logs in| NetAppS3
+Mimir -->|Stores Metrics in| NetAppS3
+Grafana -->|Visualizes Data from| Loki
+Grafana -->|Visualizes Data from| Mimir
+Alloy -->|Collects Logs from Cluster| Loki
+Alloy -->|Collects Metrics from Cluster| Mimir
+
+%% Networking and Storage
+OVN -->|Pod-to-Pod Networking| EnterpriseCluster
+DNS -->|Resolves Internal & External Domains| EnterpriseCluster
+LB -->|Exposes Services - API, Argo, Grafana, etc.| EnterpriseCluster
+NetAppSAN -->|Persistent Volumes for| Etcd
+NetAppSAN -->|Persistent Volumes for| Vault
+NetAppS3 -->|Object Storage for| Loki
+NetAppS3 -->|Object Storage for| Mimir
+
+%% Styling
+classDef layer fill:#f8f9fa,stroke:#000,color:#000;
+classDef infra fill:#e3f2fd,stroke:#1976d2,color:#000;
+classDef service fill:#e8f5e9,stroke:#388e3c,color:#000;
+classDef auth fill:#fff3e0,stroke:#f57c00,color:#000;
+classDef storage fill:#ede7f6,stroke:#512da8,color:#000;
+
+class EnterpriseCluster,ControlPlane,HyperShift,ArgoCD,Auth,Secrets,Observability,Network,Storage layer
+class APIServer,Scheduler,ControllerMgr,Etcd infra
+class HCP,HC_CR,HCPPods service
+class ArgoServer,ArgoRepo,ArgoController service
+class Keycloak,AD auth
+class Vault,VaultInjector auth
+class Grafana,Loki,Mimir,Alloy service
+class OVN,DNS,LB infra
+class NetAppSAN,NetAppS3 storage
+
+---
+
+| Layer                      | Key Components                                                    | Description                                                                        |
+| -------------------------- | ----------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| **Control Plane**          | API Server, Scheduler, Controller Manager, etcd                   | Standard OCP control plane managing the Enterprise cluster itself.                 |
+| **HyperShift Management**  | HyperShift Operator, HostedCluster CRs, Hosted Control Plane Pods | Manages all hosted production clusters (DC1/DC2). Control planes run here as pods. |
+| **ArgoCD (Platform Argo)** | Server, Controller, Repo Server                                   | Manages GitOps for infrastructure and HyperShift configuration.                    |
+| **Authentication**         | Keycloak, Active Directory                                        | Keycloak federates with AD and provides OIDC to OCP and ArgoCD.                    |
+| **Secrets**                | Vault, Vault Injector                                             | Centralized secrets and certificate distribution to all clusters.                  |
+| **Observability**          | Grafana, Loki, Mimir, Alloy                                       | Unified monitoring and logging across clusters. Stores data in NetApp S3.          |
+| **Networking & DNS**       | OVN, Load Balancer, DNS                                           | Handles pod networking, ingress routing, and DNS resolution.                       |
+| **Storage**                | NetApp SAN (CSI), NetApp S3                                       | SAN for PVs and object storage for observability and backups.                      |
+
+---
+
+graph TD
+
+%% ====== HyperShift Operator Context ======
+subgraph HCP["🌀 HyperShift Operator (Main Controller in Enterprise OCP)"]
+  Controller["Reconciliation Controller (HostedCluster & NodePool CRDs)"]
+  Lifecycle["Lifecycle Manager (Create/Update/Delete Clusters)"]
+  InfraMgr["Infrastructure Manager (DNS, Networking, Storage Provisioning)"]
+  SecretsMgr["Secrets Syncer (Vault Integration)"]
+  Metrics["Metrics Exporter (Prometheus Metrics to Mimir)"]
+end
+
+%% ====== Cluster API & OCP Integration ======
+subgraph ClusterAPI["🧩 OCP API & Platform Services"]
+  KubeAPI["Kubernetes API Server"]
+  ArgoCD["ArgoCD (Platform GitOps)"]
+  Etcd["etcd (State Store)"]
+  OVN["OVN-Kubernetes / SDN"]
+  DNS["CoreDNS / ExternalDNS"]
+end
+
+%% ====== Secrets & Auth ======
+subgraph Security["🔐 Authentication & Secrets"]
+  Keycloak["Keycloak (OIDC, Federated to AD)"]
+  Vault["HashiCorp Vault"]
+end
+
+%% ====== Storage ======
+subgraph Storage["💾 Storage Layer (NetApp)"]
+  NetAppSAN["NetApp SAN (Trident CSI for PVs)"]
+  NetAppS3["NetApp S3 (Object Storage for Logs, Backups)"]
+end
+
+%% ====== Observability ======
+subgraph Observability["📊 Observability Stack"]
+  Mimir["Mimir (Metrics DB)"]
+  Loki["Loki (Log Store)"]
+  Grafana["Grafana Dashboards"]
+end
+
+%% ====== Hosted Clusters ======
+subgraph HostedClusters["☁️ Hosted Production Clusters (DC1 / DC2)"]
+  HostedCP1["Hosted Control Plane Pods - DC1"]
+  HostedCP2["Hosted Control Plane Pods - DC2"]
+  WorkerDC1["Worker Nodes - DC1"]
+  WorkerDC2["Worker Nodes - DC2"]
+end
+
+%% ====== External ======
+subgraph External["🌍 External Systems"]
+  Admin["👩‍💻 Platform Admin"]
+  GitRepo["Git Repos (Cluster Manifests)"]
+end
+
+%% ====== Relationships ======
+Admin -->|Manages via oc CLI or Web Console| ArgoCD
+ArgoCD -->|Applies HostedCluster / NodePool Manifests| KubeAPI
+KubeAPI -->|Triggers| Controller
+
+Controller --> Lifecycle
+Controller --> InfraMgr
+Controller --> SecretsMgr
+Controller --> Metrics
+
+Lifecycle -->|Creates Hosted Control Plane Deployments| HostedCP1
+Lifecycle -->|Creates Hosted Control Plane Deployments| HostedCP2
+InfraMgr -->|Provisions Networking / DNS / PVs| OVN
+InfraMgr -->|Provisions DNS Records| DNS
+InfraMgr -->|Allocates Persistent Volumes| NetAppSAN
+
+SecretsMgr -->|Requests Secrets / Certs| Vault
+Vault -->|Provides Signed Certificates / Tokens| SecretsMgr
+
+Lifecycle -->|Stores Control Plane Backups| NetAppS3
+Metrics -->|Exports Cluster Health| Mimir
+Metrics -->|Sends Logs| Loki
+Grafana -->|Visualizes Metrics & Logs| Mimir
+Grafana -->|Visualizes Metrics & Logs| Loki
+
+Keycloak -->|Auth for Hosted API Servers| HostedCP1
+Keycloak -->|Auth for Hosted API Servers| HostedCP2
+Keycloak -->|Auth for ArgoCD| ArgoCD
+
+Vault -->|Distributes Secrets| HostedCP1
+Vault -->|Distributes Secrets| HostedCP2
+
+HostedCP1 -->|Manages| WorkerDC1
+HostedCP2 -->|Manages| WorkerDC2
+
+%% ===== Styling =====
+classDef control fill:#e3f2fd,stroke:#1976d2,color:#000;
+classDef service fill:#e8f5e9,stroke:#388e3c,color:#000;
+classDef security fill:#fff3e0,stroke:#f57c00,color:#000;
+classDef storage fill:#ede7f6,stroke:#512da8,color:#000;
+classDef obs fill:#f3e5f5,stroke:#6a1b9a,color:#000;
+classDef external fill:#fffde7,stroke:#f9a825,color:#000;
+
+class HCP,Controller,Lifecycle,InfraMgr,SecretsMgr,Metrics control
+class KubeAPI,ArgoCD,Etcd,OVN,DNS service
+class Keycloak,Vault security
+class NetAppSAN,NetAppS3 storage
+class Mimir,Loki,Grafana obs
+class HostedClusters,HostedCP1,HostedCP2,WorkerDC1,WorkerDC2 service
+class Admin,GitRepo external
+
+---
+
+| Component                     | Description                                                                                               |
+| ----------------------------- | --------------------------------------------------------------------------------------------------------- |
+| **Reconciliation Controller** | Watches `HostedCluster` and `NodePool` CRs; triggers reconciliation loops to ensure desired state.        |
+| **Lifecycle Manager**         | Provisions, scales, upgrades, and deletes hosted clusters; deploys hosted control plane pods.             |
+| **Infrastructure Manager**    | Interfaces with SDN, DNS, and NetApp CSI drivers to allocate networking and persistent storage.           |
+| **Secrets Syncer**            | Integrates with Vault to retrieve certificates, encryption keys, and inject them into control plane pods. |
+| **Metrics Exporter**          | Publishes metrics to Mimir and sends logs to Loki for centralized monitoring.                             |
+| **Vault**                     | Centralized PKI and secret storage; issues certs for API servers, service accounts, etc.                  |
+| **Keycloak**                  | OIDC identity provider federated with AD, provides cluster and ArgoCD authentication.                     |
+| **ArgoCD**                    | Applies `HostedCluster` and `NodePool` manifests from Git repositories to the management cluster API.     |
+| **NetApp SAN & S3**           | SAN used for persistent control plane data (etcd, Vault); S3 for observability and control plane backups. |
+| **Hosted Clusters**           | Control plane pods (hosted in Enterprise OCP) manage worker nodes deployed in DC1/DC2.                    |
+
+---
+
+graph TD
+
+%% Operator Process
+subgraph OperatorPod["HyperShift Operator Process (Deployment, On-Prem)"]
+  APIClient["k8s API Client (client-go)"]
+  Informers["SharedInformers / Listers"]
+  ReconcilerLoop["Controller Manager (controller-runtime)"]
+  LeaderElect["Leader Election / Lease"]
+  WorkQueue["Workqueues (rate-limited)"]
+  EventRecorder["Event Recorder"]
+  MetricsServer["Metrics Endpoint (prometheus)"]
+  WebhookServer["Admission Webhooks (Validating/Mutating)"]
+end
+
+%% Controllers / Reconcilers
+subgraph Controllers["Reconcilers / Controllers"]
+  HostedClusterCtrl["HostedCluster Controller"]
+  NodePoolCtrl["NodePool Controller"]
+  ControlPlaneCtrl["HostedControlPlane Controller"]
+  InfraCtrl["Infrastructure Controller (On-Prem Networking / DNS / Load Balancer)"]
+  StorageCtrl["Storage Provisioner Controller (NetApp CSI orchestrator)"]
+  SecretsSyncCtrl["Secrets Syncer (Vault integration)"]
+  BackupCtrl["Backup / Restore Controller"]
+  StatusSyncCtrl["Status & Condition Updater"]
+end
+
+%% Internal Modules
+subgraph Modules["Operator Modules"]
+  CRDTypes["CRD Types (HostedCluster, NodePool, etc.)"]
+  Finalizers["Finalizer Handlers"]
+  WorkloadAPI["Hosted Control Plane bootstrap logic"]
+  CertManager["Cert Manager / CSR Handler"]
+  VaultClient["Vault Client (auth, PKI, secrets)"]
+  DNSAdapter["On-Prem DNS Adapter / CoreDNS Integration"]
+  NetAppAdapter["NetApp CSI Adapter"]
+  LoadBalancerAdapter["MetalLB / On-Prem LB Adapter"]
+  GitOpsClient["ArgoCD / GitOps integration client"]
+end
+
+%% External K8s Resources & Systems
+subgraph External["External Systems & Clusters"]
+  KubeAPI["Kubernetes API Server (management cluster)"]
+  HostedCPPods["Hosted Control Plane Pods (deployed resources)"]
+  EtcdPV["etcd PVs (NetApp SAN)"]
+  NetAppS3["NetApp S3 (Object Storage, On-Prem)"]
+  VaultSvc["HashiCorp Vault (external, on-prem)"]
+  KeycloakSvc["Keycloak (OIDC, proxied to AD)"]
+  ArgoCDSvc["ArgoCD - Platform"]
+  GitRepo["Git Repositories (manifests)"]
+end
+
+%% Relationships: Operator runtime -> controllers
+OperatorPod --> Controllers
+OperatorPod --> Modules
+
+APIClient --> KubeAPI
+Informers --> APIClient
+ReconcilerLoop --> WorkQueue
+WorkQueue --> HostedClusterCtrl
+WorkQueue --> NodePoolCtrl
+WorkQueue --> ControlPlaneCtrl
+WorkQueue --> InfraCtrl
+WorkQueue --> StorageCtrl
+WorkQueue --> SecretsSyncCtrl
+WorkQueue --> BackupCtrl
+WorkQueue --> StatusSyncCtrl
+
+HostedClusterCtrl -->|reads/writes| CRDTypes
+NodePoolCtrl -->|reads/writes| CRDTypes
+ControlPlaneCtrl -->|deploys| HostedCPPods
+ControlPlaneCtrl -->|uses| CertManager
+ControlPlaneCtrl -->|uses| VaultClient
+
+InfraCtrl -->|calls| DNSAdapter
+InfraCtrl -->|calls| LoadBalancerAdapter
+StorageCtrl -->|calls| NetAppAdapter
+SecretsSyncCtrl -->|reads/writes| VaultClient
+
+GitOpsClient -->|triggers| ArgoCDSvc
+HostedClusterCtrl -->|annotates| GitRepo
+
+StatusSyncCtrl -->|updates| KubeAPI
+BackupCtrl -->|stores| NetAppS3
+ControlPlaneCtrl -->|creates PVs| EtcdPV
+
+WebhookServer -->|validates| CRDTypes
+Finalizers -->|cleanup| HostedCPPods
+
+LeaderElect --> ReconcilerLoop
+EventRecorder -->|records| KubeAPI
+MetricsServer -->|exposes| Metrics
+
+VaultClient --> VaultSvc
+KeycloakSvc -->|OIDC| KubeAPI
+ArgoCDSvc -->|syncs| GitRepo
+
+%% grouping for clarity
+classDef runtime fill:#e8f5e9,stroke:#2e7d32;
+classDef controllers fill:#e3f2fd,stroke:#1565c0;
+classDef modules fill:#fff3e0,stroke:#ef6c00;
+classDef external fill:#f3e5f5,stroke:#6a1b9a;
+
+class OperatorPod runtime
+class Controllers controllers
+class Modules modules
+class External external
+---
+Operator runtime (controller-runtime): API client, informers, leader election, workqueues, webhooks, metrics & health — standard operator scaffolding.
+HostedCluster Controller: main reconciler that watches HostedCluster CR, bootstraps hosted control plane, coordinates NodePools, and triggers infra provisioning.
+NodePool Controller: manages NodePool lifecycle (scaling, upgrade strategies) and reconciles Machine/Node objects on guest infra.
+HostedControlPlane Controller: actually creates Deployment/StatefulSet/Pods that run API server, controller-manager, scheduler and etcd (or etcd operator) in the management cluster.
+Infrastructure Controller: talks to DNSAdapter, CloudAdapter (LBs, networking), configures DNS records, load balancers and networking subnets for hosted control planes.
+Storage Provisioner Controller: orchestrates NetApp CSI via NetAppAdapter to provision PVs (etcd volumes, registry storage).
+Secrets Syncer (Vault integration): authenticates to Vault, requests PKI-signed certs, syncs secrets into Kubernetes Secrets (or mounts via injector).
+Backup/Restore Controller: schedules control-plane backups to NetApp S3 and coordinates restore flows.
+Status & Condition Updater: aggregates status from hosted control planes and updates HostedCluster status conditions.
+CertManager / CSR handler: signs CSRs, rotates control-plane certs, integrates with Vault PKI (or built-in cert-manager).
+Webhooks: validate/mutate HostedCluster/NodePool manifests for safety/immutability rules and defaulting.
+Finalizers: ensure hosted control planes & infra are cleanly deleted (LBs, DNS, PVs, S3 snapshots).
+Metrics & Events: Prometheus metrics exporter + EventRecorder for audit and observability.
+GitOpsClient: optional integration to trigger ArgoCD for deploying base manifests and bootstrap resources.
+
+---
+
+sequenceDiagram
+    participant Dev as Developer
+    participant Git as Git Repository
+    participant ArgoInfra as ArgoCD (Platform / Infra)
+    participant KubeAPI as Enterprise OCP API
+    participant HCP as HyperShift Operator
+    participant Vault as HashiCorp Vault
+    participant Keycloak as Keycloak (OIDC / AD)
+    participant DNS as On-Prem DNS
+    participant LB as MetalLB / Load Balancer
+    participant StorageSAN as NetApp SAN
+    participant StorageS3 as NetApp S3
+    participant HostedCP as Hosted Control Plane Pods
+    participant Workers as Worker Nodes (Prod DC1/DC2)
+
+    Note over Dev, Git: Developer commits HostedCluster + NodePool manifests
+
+    Dev->>Git: Push manifests (HostedCluster + NodePool)
+    Git->>ArgoInfra: ArgoCD detects changes
+    ArgoInfra->>KubeAPI: Apply manifests (HostedCluster CRs)
+    KubeAPI->>HCP: Notify HyperShift Operator of new CRs
+    HCP->>Vault: Request PKI certificates and secrets
+    Vault-->>HCP: Return certs, tokens, secrets
+    HCP->>Keycloak: Verify OIDC integration for hosted API servers
+    Keycloak-->>HCP: Provide authentication tokens
+    HCP->>DNS: Create DNS entries for hosted API endpoints
+    HCP->>LB: Allocate virtual IPs / Load balancers
+    HCP->>StorageSAN: Provision PVs for etcd and control plane pods
+    HCP->>HostedCP: Deploy Hosted Control Plane Pods (API, Scheduler, Controller Manager, etcd)
+    HostedCP->>Workers: Connect and manage worker nodes
+    HCP->>StorageS3: Backup etcd and control plane snapshots
+    HostedCP->>Vault: Use secrets/certs for API server and kubeconfigs
+    HostedCP->>Keycloak: Authenticate requests via OIDC
+    HostedCP->>ArgoInfra: Notify readiness (CR status update)
+    ArgoInfra->>Dev: Status synced - cluster is ready for application deployment
+
+    Note over HostedCP, Workers: Worker nodes are now ready, Dev can use App ArgoCD to deploy workloads
+---
+GitOps Driven — All cluster creation is triggered via manifest commits.
+Platform ArgoCD — Applies CRs to the Enterprise OCP API; operator reconciles.
+HyperShift Operator — Responsible for provisioning control plane pods, networking, storage, DNS, secrets, and LB allocation.
+Vault Integration — Provides PKI certificates, encryption keys, and secrets to control plane pods.
+Keycloak — Ensures OIDC authentication for hosted API servers and ArgoCD.
+Storage —
+NetApp SAN: PVs for etcd and other stateful components.
+NetApp S3: Control plane backups, logs, metrics storage.
+Networking / DNS — On-prem SDN, MetalLB, and DNS entries created for API endpoints.
+Hosted Control Plane Pods — Manage worker nodes deployed in production DCs.
+Status Updates — HyperShift updates HostedCluster CR status; ArgoCD reflects readiness to the developer.
+
+---
+
+sequenceDiagram
+    participant Dev as Developer
+    participant Git as Git Repository (Application Manifests)
+    participant ArgoApp as ArgoCD (App Argo, per Hosted Cluster)
+    participant HostedCP as Hosted Control Plane Pods
+    participant Workers as Worker Nodes (Prod DC1/DC2)
+    participant Vault as HashiCorp Vault
+    participant Keycloak as Keycloak (OIDC / AD)
+    participant Observability as Grafana / Loki / Mimir
+    participant StorageSAN as NetApp SAN
+    participant StorageS3 as NetApp S3
+
+    Note over Dev, Git: Developer commits application manifests (Deployment, ConfigMaps, Secrets)
+
+    Dev->>Git: Push manifests for app deployment
+    Git->>ArgoApp: ArgoCD detects changes
+    ArgoApp->>HostedCP: Apply manifests to hosted cluster
+    HostedCP->>Keycloak: Authenticate via OIDC for API requests
+    Keycloak-->>HostedCP: Provide tokens
+    HostedCP->>Vault: Request secrets for application pods
+    Vault-->>HostedCP: Return secrets (via injector or mounted Secrets)
+    HostedCP->>StorageSAN: Provision PVs if requested by apps
+    HostedCP->>Workers: Schedule pods on worker nodes
+    Workers->>StorageSAN: Mount persistent volumes
+    Workers->>Vault: Consume injected secrets/certs
+    Workers->>Observability: Export metrics & logs (Mimir, Loki)
+    Observability-->>Grafana: Visualize app metrics/logs
+    HostedCP->>ArgoApp: Update application status (ready / synced)
+    ArgoApp->>Dev: Notify deployment success / status
+
+    Note over Workers, Observability: Application running, logs and metrics collected, secrets injected
+---
+GitOps Driven — Developers push manifests to Git; ArgoCD (App Argo) detects changes.
+App ArgoCD — Runs inside each hosted cluster, deploying workloads to worker nodes.
+HyperShift Hosted Control Plane — Validates manifests, schedules pods, handles secrets and storage requests.
+Vault Integration — Provides application secrets securely via injection or mounted Kubernetes Secrets.
+Persistent Storage — NetApp SAN PVs for stateful workloads; S3 for object storage if required.
+Observability Integration — Loki collects logs, Mimir collects metrics, Grafana dashboards visualize the data.
+Keycloak Authentication — Ensures all API requests are authenticated via OIDC to hosted API servers.
+Status Feedback — ArgoCD reports sync status back to developers, indicating deployment success.
+
+---
+
+sequenceDiagram
+    participant Dev as Developer
+    participant Git as Git Repository
+    participant ArgoInfra as ArgoCD (Platform / Infra)
+    participant KubeAPI as Enterprise OCP API
+    participant HCP as HyperShift Operator
+    participant Vault as HashiCorp Vault
+    participant Keycloak as Keycloak (OIDC / AD)
+    participant DNS as On-Prem DNS
+    participant LB as MetalLB / Load Balancer
+    participant StorageSAN as NetApp SAN
+    participant StorageS3 as NetApp S3
+    participant Ansible as Ansible Bootstrapping Scripts
+    participant HostedCP as Hosted Control Plane Pods
+    participant Workers as Worker Nodes (Prod DC1/DC2)
+
+    Note over Dev, Git: Developer commits HostedCluster + NodePool manifests
+
+    Dev->>Git: Push manifests
+    Git->>ArgoInfra: ArgoCD detects changes
+    ArgoInfra->>KubeAPI: Apply manifests (HostedCluster CRs)
+    KubeAPI->>HCP: Notify HyperShift Operator of new CRs
+    HCP->>Vault: Request PKI certificates / secrets
+    Vault-->>HCP: Return certs, tokens, secrets
+    HCP->>Keycloak: Verify OIDC integration
+    Keycloak-->>HCP: Provide tokens
+    HCP->>DNS: Create DNS entries
+    HCP->>LB: Allocate virtual IPs / Load balancers
+    HCP->>StorageSAN: Provision PVs for etcd and control plane pods
+    HCP->>Ansible: Run control plane bootstrapping playbooks
+    Ansible->>HostedCP: Configure pods, networking, etcd, TLS
+    HostedCP->>Ansible: Confirm bootstrapping complete
+    HostedCP->>Ansible: Trigger worker node bootstrapping
+    Ansible->>Workers: Configure kubelet, networking, storage, secrets
+    Workers->>StorageSAN: Mount persistent volumes
+    Workers->>Vault: Consume secrets/certs
+    HostedCP->>StorageS3: Backup etcd/control plane snapshots
+    HostedCP->>Keycloak: Authenticate requests
+    HostedCP->>ArgoInfra: Update cluster readiness
+    ArgoInfra->>Dev: Cluster is ready
+---
