@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+
+import requests
+import argparse
+import logging
+import sys
+import getpass
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def initiate_generation(vault_addr):
+    """Initiates the DR token generation process."""
+    try:
+        r = requests.put(f"{vault_addr}/v1/sys/operator/generate-root/attempt")
+        r.raise_for_status()
+        data = r.json()
+        logging.info("Successfully initiated DR token generation.")
+        return data.get('nonce'), data.get('otp')
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to initiate token generation: {e}")
+        if hasattr(e, 'response') and e.response:
+            logging.error(f"Response: {e.response.text}")
+        return None, None
+    except (KeyError, ValueError) as e:
+        logging.error(f"Unexpected response format from Vault: {e}")
+        return None, None
+
+def submit_keys(vault_addr, nonce, quorum):
+    """Submits unseal keys from the operator until the quorum is met."""
+    for i in range(quorum):
+        key = getpass.getpass(f"Enter unseal key #{i+1}/{quorum} (input will be hidden): ")
+        if not key:
+            logging.error("Unseal key cannot be empty. Exiting.")
+            return None
+            
+        payload = {"key": key, "nonce": nonce}
+        try:
+            r = requests.put(f"{vault_addr}/v1/sys/operator/generate-root/update", json=payload)
+            r.raise_for_status()
+            data = r.json()
+            
+            progress = data.get('progress', 0)
+            complete = data.get('complete', False)
+            logging.info(f"Key submitted successfully. Progress: {progress}/{quorum}")
+
+            if complete:
+                encoded_token = data.get('encoded_token')
+                if not encoded_token:
+                    logging.error("Quorum met, but no encoded token found in response.")
+                    return None
+                logging.info("Quorum met. Encoded token received.")
+                return encoded_token
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Failed to submit key: {e}")
+            if hasattr(e, 'response') and e.response:
+                logging.error(f"Response: {e.response.text}")
+            logging.error("Please check the unseal key and try again. Exiting.")
+            return None
+        except (KeyError, ValueError) as e:
+            logging.error(f"Unexpected response format from Vault: {e}")
+            return None
+            
+    logging.error("Quorum not met after all keys were submitted. This may happen if the provided quorum number was incorrect.")
+    return None
+
+def decode_token(vault_addr, encoded_token):
+    """Prompts for the OTP and decodes the final DR token."""
+    otp = input("Enter the OTP from the initiation step to decode the token: ")
+    if not otp:
+        logging.error("OTP cannot be empty. Exiting.")
+        return None
+
+    payload = {"encoded_token": encoded_token, "otp": otp}
+    try:
+        r = requests.put(f"{vault_addr}/v1/sys/operator/generate-root/decode", json=payload)
+        r.raise_for_status()
+        data = r.json()
+        dr_token = data.get('token')
+        if not dr_token:
+            logging.error("Token decoding successful, but no token found in response.")
+            return None
+        return dr_token
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to decode token. This may be due to an incorrect OTP: {e}")
+        if hasattr(e, 'response') and e.response:
+            logging.error(f"Response: {e.response.text}")
+        return None
+    except (KeyError, ValueError) as e:
+        logging.error(f"Unexpected response format from Vault: {e}")
+        return None
+
+def main():
+    """
+    Main function to handle interactive DR operation token generation.
+    """
+    parser = argparse.ArgumentParser(description="Interactive Vault DR Operation Token Generation Script")
+    parser.add_argument("vault_addr", help="The address of the Vault cluster (e.g., http://127.0.0.1:8200)")
+    parser.add_argument("quorum", type=int, help="The number of unseal keys required (quorum)")
+    args = parser.parse_args()
+
+    # Step 1: Initiate
+    logging.info(f"Starting DR operation token generation for {args.vault_addr} with a quorum of {args.quorum}.")
+    nonce, otp = initiate_generation(args.vault_addr)
+    if not nonce or not otp:
+        sys.exit(1)
+
+    print("-" * 50)
+    logging.info("IMPORTANT: Please save this OTP. You will need it for the final step.")
+    print(f"Nonce: {nonce}")
+    print(f"OTP:   {otp}")
+    print("-" * 50)
+
+    # Step 2: Submit Keys
+    encoded_token = submit_keys(args.vault_addr, nonce, args.quorum)
+    if not encoded_token:
+        sys.exit(1)
+
+    # Step 3: Decode Token
+    dr_token = decode_token(args.vault_addr, encoded_token)
+    if not dr_token:
+        sys.exit(1)
+        
+    print("=" * 50)
+    logging.info("DR Operation Token generated successfully!")
+    print(f"Your DR Operation Token is: {dr_token}")
+    print("=" * 50)
+
+if __name__ == "__main__":
+    main()
