@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+
+import os
+import requests
+import argparse
+import logging
+import sys
+import time
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def get_dr_replication_status(url, token):
+    headers = {"X-Vault-Token": token}
+    try:
+        r = requests.get(f"{url}/v1/sys/replication/dr/status", headers=headers)
+        r.raise_for_status()
+        return r.json()
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to get DR replication status from {url}: {e}")
+        return None
+
+def promote_dr_secondary(url, dr_operation_token):
+    payload = {"dr_operation_token": dr_operation_token}
+    try:
+        # Note: This endpoint does not require a standard X-Vault-Token header
+        # when a DR operation token is used in the payload.
+        r = requests.post(f"{url}/v1/sys/replication/dr/secondary/promote", json=payload)
+        r.raise_for_status()
+        return True
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to promote DR secondary {url}: {e}")
+        return False
+
+def demote_dr_primary(url, token):
+    headers = {"X-Vault-Token": token}
+    try:
+        r = requests.post(f"{url}/v1/sys/replication/dr/primary/demote", headers=headers)
+        r.raise_for_status()
+        return True
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to demote DR primary {url}: {e}")
+        return False
+
+def generate_dr_secondary_token(url, token):
+    headers = {"X-Vault-Token": token}
+    try:
+        r = requests.post(f"{url}/v1/sys/replication/dr/secondary/generate-token", headers=headers)
+        r.raise_for_status()
+        return r.json()['data']['token']
+    except (requests.exceptions.RequestException, KeyError) as e:
+        logging.error(f"Failed to generate DR secondary token from {url}: {e}")
+        return None
+
+def update_dr_secondary(url, dr_operation_token, primary_token):
+    payload = {
+        "dr_operation_token": dr_operation_token,
+        "token": primary_token,
+    }
+    try:
+        r = requests.post(f"{url}/v1/sys/replication/dr/secondary/update-primary", json=payload)
+        r.raise_for_status()
+        return True
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to update DR secondary {url}: {e}")
+        return False
+
+def get_performance_replication_status(url, token):
+    headers = {"X-Vault-Token": token}
+    try:
+        r = requests.get(f"{url}/v1/sys/replication/performance/status", headers=headers)
+        r.raise_for_status()
+        return r.json()
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to get performance replication status from {url}: {e}")
+        return None
+
+def disable_performance_replication(url, token):
+    headers = {"X-Vault-Token": token}
+    try:
+        r = requests.post(f"{url}/v1/sys/replication/performance/disable", headers=headers)
+        r.raise_for_status()
+        return True
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to disable performance replication on {url}: {e}")
+        return False
+
+def generate_performance_secondary_token(url, token):
+    headers = {"X-Vault-Token": token}
+    try:
+        r = requests.post(f"{url}/v1/sys/replication/performance/secondary/generate-token", headers=headers)
+        r.raise_for_status()
+        return r.json()['data']['token']
+    except (requests.exceptions.RequestException, KeyError) as e:
+        logging.error(f"Failed to generate performance secondary token from {url}: {e}")
+        return None
+
+def enable_performance_replication(url, token, primary_token):
+    headers = {"X-Vault-Token": token}
+    payload = {"token": primary_token}
+    try:
+        r = requests.post(f"{url}/v1/sys/replication/performance/secondary/enable", headers=headers, json=payload)
+        r.raise_for_status()
+        return True
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Failed to enable performance replication on {url}: {e}")
+        return False
+
+def switch_primary(new_primary, old_primary, all_perf_replicas, dr_operation_token, dry_run=False, resilient=False):
+    """
+    Switches the primary cluster and re-parents all performance replicas to the new primary.
+    """
+    new_primary_url, new_primary_token = new_primary['url'], new_primary['token']
+    old_primary_url, old_primary_token = old_primary['url'], old_primary['token']
+
+    if dry_run:
+        logging.info(f"DRY-RUN: Promoting {new_primary_url} to primary.")
+        for replica in all_perf_replicas:
+            logging.info(f"DRY-RUN: Re-parenting {replica['url']} to new primary.")
+        logging.info(f"DRY-RUN: Demoting {old_primary_url} to be a DR secondary.")
+        return True
+
+    # --- Step 1: Demote (if planned) or Promote (if disaster) ---
+    if resilient:
+        logging.info(f"Promoting {new_primary_url} to primary...")
+        if not promote_dr_secondary(new_primary_url, dr_operation_token) or not verify_cluster_state(new_primary_url, new_primary_token, "primary"): return False
+    else:
+        logging.info(f"Graceful switchover: Demoting current primary {old_primary_url} first...")
+        if not demote_dr_primary(old_primary_url, old_primary_token) or not verify_cluster_state(old_primary_url, old_primary_token, "secondary"): return False
+        logging.info(f"Promoting {new_primary_url} to primary...")
+        if not promote_dr_secondary(new_primary_url, dr_operation_token) or not verify_cluster_state(new_primary_url, new_primary_token, "primary"): return False
+    
+    # --- Step 2: Reconfigure ALL Performance Replicas ---
+    logging.info("Reconfiguring all performance replicas to point to the new primary...")
+    for replica in all_perf_replicas:
+        replica_url, replica_token = replica['url'], replica['token']
+        if not disable_performance_replication(replica_url, replica_token):
+            if resilient: 
+                logging.warning(f"Could not disable replication on {replica_url}. Skipping.")
+                continue
+            else: return False
+        
+        primary_token = generate_performance_secondary_token(new_primary_url, new_primary_token)
+        if not primary_token or not enable_performance_replication(replica_url, replica_token, primary_token):
+            if resilient: logging.warning(f"Could not re-enable replication on {replica_url}. Manual intervention may be required.")
+            else: return False
+
+    # --- Step 3: Re-configure old primary as a new DR secondary ---
+    logging.info(f"Configuring old primary {old_primary_url} as a DR secondary...")
+    if resilient and not demote_dr_primary(old_primary_url, old_primary_token):
+        logging.warning(f"Could not demote old primary at {old_primary_url}. It may already be down.")
+
+    primary_token = generate_dr_secondary_token(new_primary_url, new_primary_token)
+    if not primary_token: return False
+
+    if not update_dr_secondary(old_primary_url, dr_operation_token, primary_token):
+        if resilient: logging.warning(f"Could not re-attach DR secondary on {old_primary_url}. Manual intervention may be required.")
+        else: return False
+
+    logging.info("Switchover complete.")
+    return True
+
+def verify_cluster_state(url, token, expected_mode, timeout=60):
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        status = get_dr_replication_status(url, token)
+        if status and status.get('data', {}).get('mode') == expected_mode:
+            logging.info(f"Cluster {url} successfully transitioned to '{expected_mode}' mode.")
+            return True
+        time.sleep(5)
+    logging.error(f"Cluster {url} failed to transition to '{expected_mode}' mode within {timeout}s.")
+    return False
+
+def preflight_checks(clients):
+    for name, client in clients.items():
+        url, token = client['url'], client['token']
+        headers = {"X-Vault-Token": token}
+        try:
+            r = requests.get(f"{url}/v1/sys/health", headers=headers)
+            r.raise_for_status()
+            if r.json().get('initialized') and not r.json().get('sealed'):
+                logging.info(f"Preflight check passed: Successfully connected to {name} at {url}")
+            else:
+                logging.error(f"Preflight check failed: Cluster {name} at {url} is not initialized or is sealed.")
+                return False
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Preflight check failed: Unable to connect to {name} at {url}: {e}")
+            return False
+    return True
+
+def get_client(url, token):
+    """Helper to create a client dictionary."""
+    return {'url': url, 'token': token}
+
+def main():
+    """
+    Main function to handle failover and failback.
+    """
+    parser = argparse.ArgumentParser(description="Vault Enterprise Failover and Failback Script")
+    parser.add_argument("command", choices=["status", "failover", "failback"], help="The command to execute")
+    parser.add_argument("--dry-run", action="store_true", help="Print the sequence of actions without executing them")
+    args = parser.parse_args()
+
+    # --- Configuration ---
+    env_vars = {
+        "dc1_cluster_addr": "DC1_CLUSTER_ADDR", "dc1_cluster_token": "DC1_CLUSTER_TOKEN",
+        "dc1_perf_addr": "DC1_PERF_REPLICA_ADDR", "dc1_perf_token": "DC1_PERF_REPLICA_TOKEN",
+        "dc2_cluster_addr": "DC2_CLUSTER_ADDR", "dc2_cluster_token": "DC2_CLUSTER_TOKEN",
+        "dc2_perf_addr": "DC2_PERF_REPLICA_ADDR", "dc2_perf_token": "DC2_PERF_REPLICA_TOKEN",
+        "dr_operation_token": "VAULT_DR_OPERATION_TOKEN",
+    }
+    config = {key: os.environ.get(val) for key, val in env_vars.items()}
+    if not all(config.values()):
+        # Exclude DR token from the "all" check for the status command
+        if args.command != "status" and not config["dr_operation_token"]:
+             logging.error(f"Missing required environment variable for failover/failback: VAULT_DR_OPERATION_TOKEN")
+             sys.exit(1)
+        # Check for other missing variables
+        if not all(val for key, val in config.items() if key != "dr_operation_token"):
+            logging.error(f"Missing one or more required cluster environment variables.")
+            sys.exit(1)
+
+    clients = {
+        "DC1 Cluster": get_client(config["dc1_cluster_addr"], config["dc1_cluster_token"]),
+        "DC1 Perf Replica": get_client(config["dc1_perf_addr"], config["dc1_perf_token"]),
+        "DC2 Cluster": get_client(config["dc2_cluster_addr"], config["dc2_cluster_token"]),
+        "DC2 Perf Replica": get_client(config["dc2_perf_addr"], config["dc2_perf_token"]),
+    }
+
+    if not args.dry_run and not preflight_checks(clients):
+        sys.exit(1)
+
+    # --- Dynamic Role Detection ---
+    primary_client, secondary_client = None, None
+    dc1_status = get_dr_replication_status(clients["DC1 Cluster"]["url"], clients["DC1 Cluster"]["token"])
+    dc2_status = get_dr_replication_status(clients["DC2 Cluster"]["url"], clients["DC2 Cluster"]["token"])
+
+    if dc1_status and dc1_status.get('data', {}).get('mode') == 'primary':
+        primary_client = clients["DC1 Cluster"]
+        secondary_client = clients["DC2 Cluster"]
+    elif dc2_status and dc2_status.get('data', {}).get('mode') == 'primary':
+        primary_client = clients["DC2 Cluster"]
+        secondary_client = clients["DC1 Cluster"]
+    
+    if not primary_client or not secondary_client:
+        logging.error("Could not determine primary and secondary clusters. Please check their status.")
+        sys.exit(1)
+
+    logging.info(f"Detected Primary: {primary_client['url']}")
+    logging.info(f"Detected Secondary: {secondary_client['url']}")
+
+    # --- Command Execution ---
+    if args.command == "status":
+        for name, client in clients.items():
+            dr_status = get_dr_replication_status(client["url"], client["token"])
+            perf_status = get_performance_replication_status(client["url"], client["token"])
+            dr_mode = dr_status.get('data', {}).get('mode', 'N/A') if dr_status else 'N/A'
+            perf_mode = perf_status.get('data', {}).get('mode', 'N/A') if perf_status else 'N/A'
+            logging.info(f"Status for {name}: DR Mode='{dr_mode}', Performance Mode='{perf_mode}'")
+
+    elif args.command == "failover":
+        logging.info(f"Attempting resilient failover to {secondary_client['url']}...")
+        if not switch_primary(
+            new_primary=secondary_client, old_primary=primary_client,
+            all_perf_replicas=[clients["DC1 Perf Replica"], clients["DC2 Perf Replica"]],
+            dr_operation_token=config["dr_operation_token"],
+            dry_run=args.dry_run, resilient=True
+        ):
+            sys.exit(1)
+
+    elif args.command == "failback":
+        logging.info(f"Attempting planned failback to {secondary_client['url']}...")
+        if not switch_primary(
+            new_primary=secondary_client, old_primary=primary_client,
+            all_perf_replicas=[clients["DC1 Perf Replica"], clients["DC2 Perf Replica"]],
+            dr_operation_token=config["dr_operation_token"],
+            dry_run=args.dry_run, resilient=False
+        ):
+            sys.exit(1)
+
+if __name__ == "__main__":
+    main()
