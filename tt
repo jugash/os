@@ -7,27 +7,10 @@ spec:
   failurePolicy: Ignore        # ✅ fail-open
   background: false
 
-  variables:
-    - name: dockerhub-orgs
-      configMap:
-        name: allowed-dockerhub-orgs
-        namespace: kyverno
-        key: orgs
-    - name: quay-orgs
-      configMap:
-        name: allowed-quay-orgs
-        namespace: kyverno
-        key: orgs
-    - name: ghcr-orgs
-      configMap:
-        name: allowed-ghcr-orgs
-        namespace: kyverno
-        key: orgs
-
   rules:
 
   # =====================================================
-  # 1️⃣ Always allow internal images
+  # 1️⃣ Allow internal images
   # =====================================================
   - name: allow-internal-images
     match:
@@ -46,13 +29,33 @@ spec:
             - image: "registry.mycorp.io/*"
 
   # =====================================================
-  # 2️⃣ Allow ONLY whitelisted external registries + orgs
+  # 2️⃣ Allow only whitelisted external registries
   # =====================================================
   - name: allow-whitelisted-external-images
     match:
       resources:
         kinds:
           - Pod
+
+    context:
+      - name: dockerhubOrgs
+        configMap:
+          name: allowed-dockerhub-orgs
+          namespace: kyverno
+          jmesPath: join(data.orgs, '|')
+
+      - name: quayOrgs
+        configMap:
+          name: allowed-quay-orgs
+          namespace: kyverno
+          jmesPath: join(data.orgs, '|')
+
+      - name: ghcrOrgs
+        configMap:
+          name: allowed-ghcr-orgs
+          namespace: kyverno
+          jmesPath: join(data.orgs, '|')
+
     validate:
       message: "Images must come from approved registries and organizations."
       anyPattern:
@@ -60,45 +63,29 @@ spec:
         # ---------- Docker Hub ----------
         - spec:
             containers:
-              - image: "docker.io/$(dockerhub-orgs)/*"
+              - image: "docker.io/({{ dockerhubOrgs }})/*"
             initContainers:
-              - image: "docker.io/$(dockerhub-orgs)/*"
+              - image: "docker.io/({{ dockerhubOrgs }})/*"
             ephemeralContainers:
-              - image: "docker.io/$(dockerhub-orgs)/*"
+              - image: "docker.io/({{ dockerhubOrgs }})/*"
 
         # ---------- Quay ----------
         - spec:
             containers:
-              - image: "quay.io/$(quay-orgs)/*"
+              - image: "quay.io/({{ quayOrgs }})/*"
             initContainers:
-              - image: "quay.io/$(quay-orgs)/*"
+              - image: "quay.io/({{ quayOrgs }})/*"
             ephemeralContainers:
-              - image: "quay.io/$(quay-orgs)/*"
+              - image: "quay.io/({{ quayOrgs }})/*"
 
         # ---------- GHCR ----------
         - spec:
             containers:
-              - image: "ghcr.io/$(ghcr-orgs)/*"
+              - image: "ghcr.io/({{ ghcrOrgs }})/*"
             initContainers:
-              - image: "ghcr.io/$(ghcr-orgs)/*"
+              - image: "ghcr.io/({{ ghcrOrgs }})/*"
             ephemeralContainers:
-              - image: "ghcr.io/$(ghcr-orgs)/*"
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: allowed-dockerhub-orgs
-  namespace: kyverno
-data:
-  orgs: "library|prometheus|grafana|hashicorp|org1|org2|org3"
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: allowed-quay-orgs
-  namespace: kyverno
-data:
-  orgs: "coreos|openshift|prometheus|orgA|orgB"
+              - image: "ghcr.io/({{ ghcrOrgs }})/*"
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -106,5 +93,7 @@ metadata:
   name: allowed-ghcr-orgs
   namespace: kyverno
 data:
-  orgs: "myorg|github|actions|orgX|orgY"
-
+  orgs:
+    - myorg
+    - github
+    - actions
