@@ -1,99 +1,151 @@
 apiVersion: kyverno.io/v2
 kind: ClusterPolicy
 metadata:
-  name: restrict-external-images-multi-registry
+  name: restrict-external-images-by-org
 spec:
   validationFailureAction: Enforce
   failurePolicy: Ignore        # ✅ fail-open
   background: false
 
   rules:
+    - name: restrict-images
+      match:
+        resources:
+          kinds:
+            - Pod
 
-  # =====================================================
-  # 1️⃣ Allow internal images
-  # =====================================================
-  - name: allow-internal-images
-    match:
-      resources:
-        kinds:
-          - Pod
-    validate:
-      message: "Internal registry images are allowed."
-      pattern:
-        spec:
-          containers:
-            - image: "registry.mycorp.io/*"
-          initContainers:
-            - image: "registry.mycorp.io/*"
-          ephemeralContainers:
-            - image: "registry.mycorp.io/*"
+      context:
+        - name: dockerhubOrgs
+          configMap:
+            name: allowed-dockerhub-orgs
+            namespace: kyverno
+        - name: quayOrgs
+          configMap:
+            name: allowed-quay-orgs
+            namespace: kyverno
+        - name: ghcrOrgs
+          configMap:
+            name: allowed-ghcr-orgs
+            namespace: kyverno
 
-  # =====================================================
-  # 2️⃣ Allow only whitelisted external registries
-  # =====================================================
-  - name: allow-whitelisted-external-images
-    match:
-      resources:
-        kinds:
-          - Pod
+      validate:
+        message: "Image registry or organization is not approved."
 
-    context:
-      - name: dockerhubOrgs
-        configMap:
-          name: allowed-dockerhub-orgs
-          namespace: kyverno
-          jmesPath: join(data.orgs, '|')
+        foreach:
 
-      - name: quayOrgs
-        configMap:
-          name: allowed-quay-orgs
-          namespace: kyverno
-          jmesPath: join(data.orgs, '|')
+          # =====================================================
+          # containers
+          # =====================================================
+          - list: "images.containers"
+            preconditions:
+              all:
+                - key: "{{ element.registry }}"
+                  operator: NotEquals
+                  value: "registry.mycorp.io"
 
-      - name: ghcrOrgs
-        configMap:
-          name: allowed-ghcr-orgs
-          namespace: kyverno
-          jmesPath: join(data.orgs, '|')
+            deny:
+              conditions:
+                any:
 
-    validate:
-      message: "Images must come from approved registries and organizations."
-      anyPattern:
+                  # ---------- Docker Hub ----------
+                  - all:
+                      - key: "{{ element.registry || 'docker.io' }}"
+                        operator: Equals
+                        value: "docker.io"
+                      - key: "{{ element.repository.split('/')[0] || 'library' }}"
+                        operator: NotIn
+                        value: "{{ parse_yaml(dockerhubOrgs.data.orgs) }}"
 
-        # ---------- Docker Hub ----------
-        - spec:
-            containers:
-              - image: "docker.io/({{ dockerhubOrgs }})/*"
-            initContainers:
-              - image: "docker.io/({{ dockerhubOrgs }})/*"
-            ephemeralContainers:
-              - image: "docker.io/({{ dockerhubOrgs }})/*"
+                  # ---------- Quay ----------
+                  - all:
+                      - key: "{{ element.registry }}"
+                        operator: Equals
+                        value: "quay.io"
+                      - key: "{{ element.repository.split('/')[0] }}"
+                        operator: NotIn
+                        value: "{{ parse_yaml(quayOrgs.data.orgs) }}"
 
-        # ---------- Quay ----------
-        - spec:
-            containers:
-              - image: "quay.io/({{ quayOrgs }})/*"
-            initContainers:
-              - image: "quay.io/({{ quayOrgs }})/*"
-            ephemeralContainers:
-              - image: "quay.io/({{ quayOrgs }})/*"
+                  # ---------- GHCR ----------
+                  - all:
+                      - key: "{{ element.registry }}"
+                        operator: Equals
+                        value: "ghcr.io"
+                      - key: "{{ element.repository.split('/')[0] }}"
+                        operator: NotIn
+                        value: "{{ parse_yaml(ghcrOrgs.data.orgs) }}"
 
-        # ---------- GHCR ----------
-        - spec:
-            containers:
-              - image: "ghcr.io/({{ ghcrOrgs }})/*"
-            initContainers:
-              - image: "ghcr.io/({{ ghcrOrgs }})/*"
-            ephemeralContainers:
-              - image: "ghcr.io/({{ ghcrOrgs }})/*"
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: allowed-ghcr-orgs
-  namespace: kyverno
-data:
-  orgs:
-    - myorg
-    - github
-    - actions
+          # =====================================================
+          # initContainers
+          # =====================================================
+          - list: "images.initContainers"
+            preconditions:
+              all:
+                - key: "{{ element.registry }}"
+                  operator: NotEquals
+                  value: "registry.mycorp.io"
+
+            deny:
+              conditions:
+                any:
+
+                  - all:
+                      - key: "{{ element.registry || 'docker.io' }}"
+                        operator: Equals
+                        value: "docker.io"
+                      - key: "{{ element.repository.split('/')[0] || 'library' }}"
+                        operator: NotIn
+                        value: "{{ parse_yaml(dockerhubOrgs.data.orgs) }}"
+
+                  - all:
+                      - key: "{{ element.registry }}"
+                        operator: Equals
+                        value: "quay.io"
+                      - key: "{{ element.repository.split('/')[0] }}"
+                        operator: NotIn
+                        value: "{{ parse_yaml(quayOrgs.data.orgs) }}"
+
+                  - all:
+                      - key: "{{ element.registry }}"
+                        operator: Equals
+                        value: "ghcr.io"
+                      - key: "{{ element.repository.split('/')[0] }}"
+                        operator: NotIn
+                        value: "{{ parse_yaml(ghcrOrgs.data.orgs) }}"
+
+          # =====================================================
+          # ephemeralContainers
+          # =====================================================
+          - list: "images.ephemeralContainers"
+            preconditions:
+              all:
+                - key: "{{ element.registry }}"
+                  operator: NotEquals
+                  value: "registry.mycorp.io"
+
+            deny:
+              conditions:
+                any:
+
+                  - all:
+                      - key: "{{ element.registry || 'docker.io' }}"
+                        operator: Equals
+                        value: "docker.io"
+                      - key: "{{ element.repository.split('/')[0] || 'library' }}"
+                        operator: NotIn
+                        value: "{{ parse_yaml(dockerhubOrgs.data.orgs) }}"
+
+                  - all:
+                      - key: "{{ element.registry }}"
+                        operator: Equals
+                        value: "quay.io"
+                      - key: "{{ element.repository.split('/')[0] }}"
+                        operator: NotIn
+                        value: "{{ parse_yaml(quayOrgs.data.orgs) }}"
+
+                  - all:
+                      - key: "{{ element.registry }}"
+                        operator: Equals
+                        value: "ghcr.io"
+                      - key: "{{ element.repository.split('/')[0] }}"
+                        operator: NotIn
+                        value: "{{ parse_yaml(ghcrOrgs.data.orgs) }}"
