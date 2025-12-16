@@ -1,151 +1,77 @@
 apiVersion: kyverno.io/v2
 kind: ClusterPolicy
 metadata:
-  name: restrict-external-images-by-org
+  name: enforce-whitelisted-images
 spec:
   validationFailureAction: Enforce
-  failurePolicy: Ignore        # ✅ fail-open
+  failurePolicy: Ignore
   background: false
 
   rules:
-    - name: restrict-images
+    - name: whitelist-images
       match:
         resources:
           kinds:
             - Pod
-
       context:
-        - name: dockerhubOrgs
+        - name: allowedRegistries
           configMap:
-            name: allowed-dockerhub-orgs
+            name: allowed-registries
             namespace: kyverno
-        - name: quayOrgs
-          configMap:
-            name: allowed-quay-orgs
-            namespace: kyverno
-        - name: ghcrOrgs
-          configMap:
-            name: allowed-ghcr-orgs
-            namespace: kyverno
-
       validate:
-        message: "Image registry or organization is not approved."
+        message: "Container image is not from a whitelisted registry or organization."
 
         foreach:
-
-          # =====================================================
-          # containers
-          # =====================================================
           - list: "images.containers"
             preconditions:
-              all:
+              any:
+                # Skip internal images
                 - key: "{{ element.registry }}"
-                  operator: NotEquals
+                  operator: Equals
                   value: "registry.mycorp.io"
-
             deny:
               conditions:
-                any:
+                all:
+                  # Deny if registry is not in whitelist
+                  - key: "{{ element.registry }}"
+                    operator: NotIn
+                    value: "{{ parse_yaml(allowedRegistries.data.registries) | keys }}"
 
-                  # ---------- Docker Hub ----------
-                  - all:
-                      - key: "{{ element.registry || 'docker.io' }}"
-                        operator: Equals
-                        value: "docker.io"
-                      - key: "{{ element.repository.split('/')[0] || 'library' }}"
-                        operator: NotIn
-                        value: "{{ parse_yaml(dockerhubOrgs.data.orgs) }}"
+                  # Deny if org is not allowed for the registry
+                  - key: "{{ element.repository.split('/')[0] || 'library' }}"
+                    operator: NotIn
+                    value: "{{ parse_yaml(allowedRegistries.data.registries)[element.registry || 'docker.io'] }}"
 
-                  # ---------- Quay ----------
-                  - all:
-                      - key: "{{ element.registry }}"
-                        operator: Equals
-                        value: "quay.io"
-                      - key: "{{ element.repository.split('/')[0] }}"
-                        operator: NotIn
-                        value: "{{ parse_yaml(quayOrgs.data.orgs) }}"
-
-                  # ---------- GHCR ----------
-                  - all:
-                      - key: "{{ element.registry }}"
-                        operator: Equals
-                        value: "ghcr.io"
-                      - key: "{{ element.repository.split('/')[0] }}"
-                        operator: NotIn
-                        value: "{{ parse_yaml(ghcrOrgs.data.orgs) }}"
-
-          # =====================================================
-          # initContainers
-          # =====================================================
+          # Repeat for initContainers
           - list: "images.initContainers"
             preconditions:
-              all:
+              any:
                 - key: "{{ element.registry }}"
-                  operator: NotEquals
+                  operator: Equals
                   value: "registry.mycorp.io"
-
             deny:
               conditions:
-                any:
+                all:
+                  - key: "{{ element.registry }}"
+                    operator: NotIn
+                    value: "{{ parse_yaml(allowedRegistries.data.registries) | keys }}"
+                  - key: "{{ element.repository.split('/')[0] || 'library' }}"
+                    operator: NotIn
+                    value: "{{ parse_yaml(allowedRegistries.data.registries)[element.registry || 'docker.io'] }}"
 
-                  - all:
-                      - key: "{{ element.registry || 'docker.io' }}"
-                        operator: Equals
-                        value: "docker.io"
-                      - key: "{{ element.repository.split('/')[0] || 'library' }}"
-                        operator: NotIn
-                        value: "{{ parse_yaml(dockerhubOrgs.data.orgs) }}"
-
-                  - all:
-                      - key: "{{ element.registry }}"
-                        operator: Equals
-                        value: "quay.io"
-                      - key: "{{ element.repository.split('/')[0] }}"
-                        operator: NotIn
-                        value: "{{ parse_yaml(quayOrgs.data.orgs) }}"
-
-                  - all:
-                      - key: "{{ element.registry }}"
-                        operator: Equals
-                        value: "ghcr.io"
-                      - key: "{{ element.repository.split('/')[0] }}"
-                        operator: NotIn
-                        value: "{{ parse_yaml(ghcrOrgs.data.orgs) }}"
-
-          # =====================================================
-          # ephemeralContainers
-          # =====================================================
+          # Repeat for ephemeralContainers
           - list: "images.ephemeralContainers"
             preconditions:
-              all:
+              any:
                 - key: "{{ element.registry }}"
-                  operator: NotEquals
+                  operator: Equals
                   value: "registry.mycorp.io"
-
             deny:
               conditions:
-                any:
-
-                  - all:
-                      - key: "{{ element.registry || 'docker.io' }}"
-                        operator: Equals
-                        value: "docker.io"
-                      - key: "{{ element.repository.split('/')[0] || 'library' }}"
-                        operator: NotIn
-                        value: "{{ parse_yaml(dockerhubOrgs.data.orgs) }}"
-
-                  - all:
-                      - key: "{{ element.registry }}"
-                        operator: Equals
-                        value: "quay.io"
-                      - key: "{{ element.repository.split('/')[0] }}"
-                        operator: NotIn
-                        value: "{{ parse_yaml(quayOrgs.data.orgs) }}"
-
-                  - all:
-                      - key: "{{ element.registry }}"
-                        operator: Equals
-                        value: "ghcr.io"
-                      - key: "{{ element.repository.split('/')[0] }}"
-                        operator: NotIn
-                        value: "{{ parse_yaml(ghcrOrgs.data.orgs) }}"
+                all:
+                  - key: "{{ element.registry }}"
+                    operator: NotIn
+                    value: "{{ parse_yaml(allowedRegistries.data.registries) | keys }}"
+                  - key: "{{ element.repository.split('/')[0] || 'library' }}"
+                    operator: NotIn
+                    value: "{{ parse_yaml(allowedRegistries.data.registries)[element.registry || 'docker.io'] }}"
