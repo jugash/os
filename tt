@@ -1,1 +1,110 @@
+apiVersion: kyverno.io/v2
+kind: ClusterPolicy
+metadata:
+  name: restrict-external-images-multi-registry
+spec:
+  validationFailureAction: Enforce
+  failurePolicy: Ignore        # ✅ fail-open
+  background: false
+
+  variables:
+    - name: dockerhub-orgs
+      configMap:
+        name: allowed-dockerhub-orgs
+        namespace: kyverno
+        key: orgs
+    - name: quay-orgs
+      configMap:
+        name: allowed-quay-orgs
+        namespace: kyverno
+        key: orgs
+    - name: ghcr-orgs
+      configMap:
+        name: allowed-ghcr-orgs
+        namespace: kyverno
+        key: orgs
+
+  rules:
+
+  # =====================================================
+  # 1️⃣ Always allow internal images
+  # =====================================================
+  - name: allow-internal-images
+    match:
+      resources:
+        kinds:
+          - Pod
+    validate:
+      message: "Internal registry images are allowed."
+      pattern:
+        spec:
+          containers:
+            - image: "registry.mycorp.io/*"
+          initContainers:
+            - image: "registry.mycorp.io/*"
+          ephemeralContainers:
+            - image: "registry.mycorp.io/*"
+
+  # =====================================================
+  # 2️⃣ Allow ONLY whitelisted external registries + orgs
+  # =====================================================
+  - name: allow-whitelisted-external-images
+    match:
+      resources:
+        kinds:
+          - Pod
+    validate:
+      message: "Images must come from approved registries and organizations."
+      anyPattern:
+
+        # ---------- Docker Hub ----------
+        - spec:
+            containers:
+              - image: "docker.io/$(dockerhub-orgs)/*"
+            initContainers:
+              - image: "docker.io/$(dockerhub-orgs)/*"
+            ephemeralContainers:
+              - image: "docker.io/$(dockerhub-orgs)/*"
+
+        # ---------- Quay ----------
+        - spec:
+            containers:
+              - image: "quay.io/$(quay-orgs)/*"
+            initContainers:
+              - image: "quay.io/$(quay-orgs)/*"
+            ephemeralContainers:
+              - image: "quay.io/$(quay-orgs)/*"
+
+        # ---------- GHCR ----------
+        - spec:
+            containers:
+              - image: "ghcr.io/$(ghcr-orgs)/*"
+            initContainers:
+              - image: "ghcr.io/$(ghcr-orgs)/*"
+            ephemeralContainers:
+              - image: "ghcr.io/$(ghcr-orgs)/*"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: allowed-dockerhub-orgs
+  namespace: kyverno
+data:
+  orgs: "library|prometheus|grafana|hashicorp|org1|org2|org3"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: allowed-quay-orgs
+  namespace: kyverno
+data:
+  orgs: "coreos|openshift|prometheus|orgA|orgB"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: allowed-ghcr-orgs
+  namespace: kyverno
+data:
+  orgs: "myorg|github|actions|orgX|orgY"
 
