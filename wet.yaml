@@ -1,0 +1,92 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: simple-testflight-workflow
+  # Change namespace if needed, usually installed where the operator runs or globally
+  namespace: default 
+spec:
+  entrypoint: run-testflight
+  arguments:
+    parameters:
+      - name: applications
+        value: "[]"
+      - name: checks
+        value: "[]"
+
+  templates:
+    # ----------------------------------------------------
+    # Main Entrypoint
+    # ----------------------------------------------------
+    - name: run-testflight
+      steps:
+        # Step 1: Deploy all applications in parallel
+        - - name: deploy-apps
+            template: deploy-application
+            # Iterate over the JSON strings passed from the Operator
+            withParam: "{{workflow.parameters.applications}}"
+            arguments:
+              parameters:
+                - name: app-spec
+                  value: "{{item}}"
+
+        # Step 2: Run all checks in parallel (after deployment finishes)
+        - - name: run-checks
+            template: execute-check
+            withParam: "{{workflow.parameters.checks}}"
+            arguments:
+              parameters:
+                - name: check-spec
+                  value: "{{item}}"
+
+    # ----------------------------------------------------
+    # Template: Deploy Application
+    # ----------------------------------------------------
+    - name: deploy-application
+      inputs:
+        parameters:
+          - name: app-spec
+      script:
+        image: bitnami/kubectl:latest
+        command: [bash]
+        source: |
+          echo "========================================"
+          echo "Deploying Application: {{inputs.parameters.app-spec.name}}"
+          echo "Source URL: {{inputs.parameters.app-spec.sourceUrl}}"
+          echo "Version: {{inputs.parameters.app-spec.version}}"
+          echo "========================================"
+          
+          # In a real scenario, you would use Helm or kubectl apply here.
+          # Example: helm install {{inputs.parameters.app-spec.name}} {{inputs.parameters.app-spec.sourceUrl}} ...
+          
+          echo "Simulating deployment..."
+          sleep 2
+          echo "Deployment complete."
+
+    # ----------------------------------------------------
+    # Template: Execute Check
+    # ----------------------------------------------------
+    - name: execute-check
+      inputs:
+        parameters:
+          - name: check-spec
+      script:
+        image: bitnami/kubectl:latest
+        command: [bash]
+        source: |
+          echo "========================================"
+          echo "Running Check: {{inputs.parameters.check-spec.name}}"
+          echo "Image: {{inputs.parameters.check-spec.image}}"
+          echo "========================================"
+          
+          # Run the actual command defined in the check spec
+          # Note: We are echoing it here for safety in this example.
+          # To actually run it, you might use a 'container' template instead of 'script'
+          # and override the image/command dynamically, but that requires more complex Argo logic.
+          # For a "script" runner, we just simulate:
+          
+          CMD="{{inputs.parameters.check-spec.command}}"
+          echo "Would execute: $CMD"
+          
+          echo "Simulating check execution..."
+          sleep 2
+          echo "Check passed."
