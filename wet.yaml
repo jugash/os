@@ -1,92 +1,327 @@
-apiVersion: argoproj.io/v1alpha1
-kind: WorkflowTemplate
-metadata:
-  name: simple-testflight-workflow
-  # Change namespace if needed, usually installed where the operator runs or globally
-  namespace: default 
-spec:
-  entrypoint: run-testflight
-  arguments:
-    parameters:
-      - name: applications
-        value: "[]"
-      - name: checks
-        value: "[]"
+package com.example.testflight.workflow;
 
-  templates:
-    # ----------------------------------------------------
-    # Main Entrypoint
-    # ----------------------------------------------------
-    - name: run-testflight
-      steps:
-        # Step 1: Deploy all applications in parallel
-        - - name: deploy-apps
-            template: deploy-application
-            # Iterate over the JSON strings passed from the Operator
-            withParam: "{{workflow.parameters.applications}}"
-            arguments:
-              parameters:
-                - name: app-spec
-                  value: "{{item}}"
+import com.example.testflight.crd.NamespaceConfig;
+import com.example.testflight.crd.TestFlight;
+import com.example.testflight.crd.WorkflowConfig;
+import io.fabric8.kubernetes.api.model.GenericKubernetesResource;
+import io.fabric8.kubernetes.api.model.GenericKubernetesResourceBuilder;
+import io.fabric8.kubernetes.api.model.OwnerReference;
+import io.fabric8.kubernetes.api.model.OwnerReferenceBuilder;
+import io.fabric8.kubernetes.api.model.ServiceAccount;
+import io.fabric8.kubernetes.api.model.ServiceAccountBuilder;
+import io.fabric8.kubernetes.api.model.rbac.RoleBinding;
+import io.fabric8.kubernetes.api.model.rbac.RoleBindingBuilder;
+import io.fabric8.kubernetes.client.KubernetesClient;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.stereotype.Service;
 
-        # Step 2: Run all checks in parallel (after deployment finishes)
-        - - name: run-checks
-            template: execute-check
-            withParam: "{{workflow.parameters.checks}}"
-            arguments:
-              parameters:
-                - name: check-spec
-                  value: "{{item}}"
+import java.util.*;
 
-    # ----------------------------------------------------
-    # Template: Deploy Application
-    # ----------------------------------------------------
-    - name: deploy-application
-      inputs:
-        parameters:
-          - name: app-spec
-      script:
-        image: bitnami/kubectl:latest
-        command: [bash]
-        source: |
-          echo "========================================"
-          echo "Deploying Application: {{inputs.parameters.app-spec.name}}"
-          echo "Source URL: {{inputs.parameters.app-spec.sourceUrl}}"
-          echo "Version: {{inputs.parameters.app-spec.version}}"
-          echo "========================================"
-          
-          # In a real scenario, you would use Helm or kubectl apply here.
-          # Example: helm install {{inputs.parameters.app-spec.name}} {{inputs.parameters.app-spec.sourceUrl}} ...
-          
-          echo "Simulating deployment..."
-          sleep 2
-          echo "Deployment complete."
+/**
+ * Argo Workflow implementation of the WorkflowEngine interface.
+ * Creates Argo Workflow resources in Kubernetes to run automated tests.
+ * 
+ * Enable this engine by setting: workflow.engine=argo
+ */
+@Service
+@ConditionalOnProperty(name = "workflow.engine", havingValue = "argo")
+public class ArgoWorkflowEngine implements WorkflowEngine {
 
-    # ----------------------------------------------------
-    # Template: Execute Check
-    # ----------------------------------------------------
-    - name: execute-check
-      inputs:
-        parameters:
-          - name: check-spec
-      script:
-        image: bitnami/kubectl:latest
-        command: [bash]
-        source: |
-          echo "========================================"
-          echo "Running Check: {{inputs.parameters.check-spec.name}}"
-          echo "Image: {{inputs.parameters.check-spec.image}}"
-          echo "========================================"
-          
-          # Run the actual command defined in the check spec
-          # Note: We are echoing it here for safety in this example.
-          # To actually run it, you might use a 'container' template instead of 'script'
-          # and override the image/command dynamically, but that requires more complex Argo logic.
-          # For a "script" runner, we just simulate:
-          
-          CMD="{{inputs.parameters.check-spec.command}}"
-          echo "Would execute: $CMD"
-          
-          echo "Simulating check execution..."
-          sleep 2
-          echo "Check passed."
+    private static final Logger log = LoggerFactory.getLogger(ArgoWorkflowEngine.class);
+
+    private static final String ARGO_API_VERSION = "argoproj.io/v1alpha1";
+    private static final String ARGO_WORKFLOW_KIND = "Workflow";
+    private static final String WORKFLOW_LABEL_TESTFLIGHT = "testing.jugash.com/testflight";
+    private static final String WORKFLOW_LABEL_MANAGED_BY = "app.kubernetes.io/managed-by";
+
+    private final KubernetesClient client;
+    private final com.fasterxml.jackson.databind.ObjectMapper objectMapper;
+
+    public ArgoWorkflowEngine(KubernetesClient client) {
+        this.client = client;
+        this.objectMapper = new com.fasterxml.jackson.databind.ObjectMapper();
+        log.info("ArgoWorkflowEngine initialized - Argo Workflows integration enabled");
+    }
+
+    @Override
+    public boolean triggerWorkflow(TestFlight testFlight) {
+        String testFlightName = testFlight.getMetadata().getName();
+        String namespace = testFlight.getMetadata().getNamespace();
+        WorkflowConfig workflowConfig = testFlight.getSpec().getWorkflow();
+
+        if (workflowConfig == null) {
+            log.info("No workflow configuration for TestFlight: {}", testFlightName);
+            return true;
+        }
+
+        if (workflowConfig.getTemplateName() == null || workflowConfig.getTemplateName().isBlank()) {
+            log.warn("No workflow template specified for TestFlight: {}", testFlightName);
+            return false;
+        }
+
+        // Check if workflow already exists for this TestFlight
+        if (resourceExistsForTestFlight(namespace, testFlightName, ARGO_WORKFLOW_KIND)) {
+            log.info("Workflow already exists for TestFlight: {}", testFlightName);
+            return true;
+        }
+
+        try {
+            // Ensure RBAC is set up (ServiceAccount + RoleBindings)
+            ensureRbac(testFlight, namespace);
+
+            GenericKubernetesResource workflow = buildWorkflow(testFlight, workflowConfig);
+            client.genericKubernetesResources(ARGO_API_VERSION, ARGO_WORKFLOW_KIND)
+                    .inNamespace(namespace)
+                    .resource(workflow)
+                    .create();
+
+            log.info("Created Argo Workflow '{}' for TestFlight: {}",
+                    workflow.getMetadata().getName(), testFlightName);
+            return true;
+
+        } catch (Exception e) {
+            log.error("Failed to create Argo Workflow for TestFlight: {}", testFlightName, e);
+            return false;
+        }
+    }
+
+    @Override
+    public WorkflowStatus getWorkflowStatus(TestFlight testFlight) {
+        String testFlightName = testFlight.getMetadata().getName();
+        String namespace = testFlight.getMetadata().getNamespace();
+
+        try {
+            // Check for Workflow
+            var workflows = client.genericKubernetesResources(ARGO_API_VERSION, ARGO_WORKFLOW_KIND)
+                    .inNamespace(namespace)
+                    .withLabel(WORKFLOW_LABEL_TESTFLIGHT, testFlightName)
+                    .list();
+
+            if (!workflows.getItems().isEmpty()) {
+                GenericKubernetesResource workflow = workflows.getItems().get(0);
+                Map<String, Object> status = (Map<String, Object>) workflow.getAdditionalProperties().get("status");
+
+                if (status == null) {
+                    return WorkflowStatus.running("Workflow starting...");
+                }
+
+                String phase = (String) status.get("phase");
+                String message = (String) status.getOrDefault("message", "");
+
+                return switch (phase) {
+                    case "Succeeded" -> WorkflowStatus.succeeded(message);
+                    case "Failed", "Error" -> WorkflowStatus.failed(message);
+                    default -> WorkflowStatus.running(phase + ": " + message);
+                };
+            }
+
+            return null;
+
+        } catch (Exception e) {
+            log.warn("Error checking workflow status for TestFlight {}: {}", testFlightName, e.getMessage());
+            return null;
+        }
+    }
+
+    @Override
+    public boolean cancelWorkflow(TestFlight testFlight) {
+        String testFlightName = testFlight.getMetadata().getName();
+        String namespace = testFlight.getMetadata().getNamespace();
+
+        try {
+            // Cancel Workflows
+            var workflows = client.genericKubernetesResources(ARGO_API_VERSION, ARGO_WORKFLOW_KIND)
+                    .inNamespace(namespace)
+                    .withLabel(WORKFLOW_LABEL_TESTFLIGHT, testFlightName)
+                    .list();
+
+            if (!workflows.getItems().isEmpty()) {
+                for (GenericKubernetesResource workflow : workflows.getItems()) {
+                    terminateWorkflow(workflow, namespace, testFlightName);
+                }
+            }
+
+            return true;
+
+        } catch (Exception e) {
+            log.error("Error cancelling workflow for TestFlight {}: {}", testFlightName, e.getMessage(), e);
+            return false;
+        }
+    }
+
+    private void terminateWorkflow(GenericKubernetesResource workflow, String namespace, String testFlightName) {
+        String workflowName = workflow.getMetadata().getName();
+        // Argo Workflows can be stopped by setting spec.shutdown = "Terminate"
+        Map<String, Object> spec = (Map<String, Object>) workflow.getAdditionalProperties().get("spec");
+        if (spec == null) {
+            spec = new LinkedHashMap<>();
+        }
+        spec.put("shutdown", "Terminate");
+        workflow.getAdditionalProperties().put("spec", spec);
+
+        client.genericKubernetesResources(ARGO_API_VERSION, ARGO_WORKFLOW_KIND)
+                .inNamespace(namespace)
+                .resource(workflow)
+                .patch();
+
+        log.info("Terminated Argo Workflow '{}' for TestFlight: {}", workflowName, testFlightName);
+    }
+
+    private boolean resourceExistsForTestFlight(String namespace, String testFlightName, String kind) {
+        try {
+            var resources = client.genericKubernetesResources(ARGO_API_VERSION, kind)
+                    .inNamespace(namespace)
+                    .withLabel(WORKFLOW_LABEL_TESTFLIGHT, testFlightName)
+                    .list();
+            return !resources.getItems().isEmpty();
+        } catch (Exception e) {
+            log.debug("Could not check for existing {}: {}", kind, e.getMessage());
+            return false;
+        }
+    }
+
+    private GenericKubernetesResource buildWorkflow(TestFlight testFlight, WorkflowConfig config) {
+        String testFlightName = testFlight.getMetadata().getName();
+        String workflowName = generateWorkflowName(testFlightName);
+        String saName = testFlightName + "-sa";
+
+        Map<String, Object> spec = new LinkedHashMap<>();
+        spec.put("workflowTemplateRef", Map.of("name", config.getTemplateName()));
+        spec.put("serviceAccountName", saName);
+
+        List<Map<String, Object>> parameters = buildParameters(testFlight, config);
+        if (!parameters.isEmpty()) {
+            spec.put("arguments", Map.of("parameters", parameters));
+        }
+
+        // Build labels - start with defaults, then add user-provided
+        Map<String, String> labels = new LinkedHashMap<>();
+        labels.put(WORKFLOW_LABEL_TESTFLIGHT, testFlightName);
+        labels.put(WORKFLOW_LABEL_MANAGED_BY, "testflight-operator");
+        if (config.getLabels() != null) {
+            labels.putAll(config.getLabels());
+        }
+
+        // Build annotations
+        Map<String, String> annotations = new LinkedHashMap<>();
+        if (config.getAnnotations() != null) {
+            annotations.putAll(config.getAnnotations());
+        }
+
+        var metadataBuilder = new GenericKubernetesResourceBuilder()
+                .withApiVersion(ARGO_API_VERSION)
+                .withKind(ARGO_WORKFLOW_KIND)
+                .withNewMetadata()
+                .withName(workflowName)
+                .withNamespace(testFlight.getMetadata().getNamespace())
+                .withLabels(labels);
+
+        if (!annotations.isEmpty()) {
+            metadataBuilder.withAnnotations(annotations);
+        }
+
+        return metadataBuilder
+                .addToOwnerReferences(createOwnerReference(testFlight))
+                .endMetadata()
+                .withAdditionalProperties(Map.of("spec", spec))
+                .build();
+    }
+
+    private String generateWorkflowName(String testFlightName) {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String baseName = testFlightName.length() > 50
+                ? testFlightName.substring(0, 50)
+                : testFlightName;
+        return String.format("%s-%s", baseName, suffix);
+    }
+
+    private List<Map<String, Object>> buildParameters(TestFlight testFlight, WorkflowConfig config) {
+        List<Map<String, Object>> params = new ArrayList<>();
+
+        // Pass the TestFlight name so the workflow knows the prefix for namespaces
+        params.add(Map.of("name", "testflight_name", "value", testFlight.getMetadata().getName()));
+
+        if (config.getApplications() != null && !config.getApplications().isEmpty()) {
+            try {
+                String appsJson = objectMapper.writeValueAsString(config.getApplications());
+                params.add(Map.of("name", "applications", "value", appsJson));
+            } catch (Exception e) {
+                log.error("Failed to serialize applications", e);
+            }
+        }
+
+        if (config.getChecks() != null && !config.getChecks().isEmpty()) {
+            try {
+                String checksJson = objectMapper.writeValueAsString(config.getChecks());
+                params.add(Map.of("name", "checks", "value", checksJson));
+            } catch (Exception e) {
+                log.error("Failed to serialize checks", e);
+            }
+        }
+
+        return params;
+    }
+
+    private void ensureRbac(TestFlight testFlight, String namespace) {
+        String testFlightName = testFlight.getMetadata().getName();
+        String saName = testFlightName + "-sa";
+
+        // 1. Create ServiceAccount
+        ServiceAccount sa = new ServiceAccountBuilder()
+                .withNewMetadata()
+                .withName(saName)
+                .withNamespace(namespace)
+                .addToLabels(WORKFLOW_LABEL_TESTFLIGHT, testFlightName)
+                .addToOwnerReferences(createOwnerReference(testFlight))
+                .endMetadata()
+                .build();
+        client.serviceAccounts().inNamespace(namespace).resource(sa).createOrReplace();
+
+        // 2. Create RoleBindings in each target namespace
+        List<NamespaceConfig> namespaceConfigs = testFlight.getSpec().getNamespaces();
+        if (namespaceConfigs != null) {
+            for (NamespaceConfig nsConfig : namespaceConfigs) {
+                // Assuming naming convention: {testFlightName}-{nsConfigName}
+                String targetNs = testFlightName + "-" + nsConfig.getName();
+
+                RoleBinding rb = new RoleBindingBuilder()
+                        .withNewMetadata()
+                        .withName(testFlightName + "-admin-binding") // Unique binding name
+                        .withNamespace(targetNs)
+                        .addToLabels(WORKFLOW_LABEL_TESTFLIGHT, testFlightName)
+                        .endMetadata()
+                        .addNewSubject()
+                        .withKind("ServiceAccount")
+                        .withName(saName)
+                        .withNamespace(namespace)
+                        .endSubject()
+                        .withNewRoleRef()
+                        .withKind("ClusterRole")
+                        .withName("admin") // Using 'admin' for full control within namespace
+                        .withApiGroup("rbac.authorization.k8s.io")
+                        .endRoleRef()
+                        .build();
+
+                try {
+                    client.rbac().roleBindings().inNamespace(targetNs).resource(rb).createOrReplace();
+                    log.info("Created RoleBinding in {} for ServiceAccount {}", targetNs, saName);
+                } catch (Exception e) {
+                    log.warn("Failed to create RoleBinding in {}: {}", targetNs, e.getMessage());
+                }
+            }
+        }
+    }
+
+    private OwnerReference createOwnerReference(TestFlight testFlight) {
+        return new OwnerReferenceBuilder()
+                .withApiVersion(testFlight.getApiVersion())
+                .withKind(testFlight.getKind())
+                .withName(testFlight.getMetadata().getName())
+                .withUid(testFlight.getMetadata().getUid())
+                .withController(true)
+                .withBlockOwnerDeletion(true)
+                .build();
+    }
+}
