@@ -1,327 +1,529 @@
 package com.example.testflight.workflow;
 
-import com.example.testflight.crd.NamespaceConfig;
 import com.example.testflight.crd.TestFlight;
+import com.example.testflight.crd.TestFlightSpec;
+
 import com.example.testflight.crd.WorkflowConfig;
 import io.fabric8.kubernetes.api.model.GenericKubernetesResource;
-import io.fabric8.kubernetes.api.model.GenericKubernetesResourceBuilder;
-import io.fabric8.kubernetes.api.model.OwnerReference;
-import io.fabric8.kubernetes.api.model.OwnerReferenceBuilder;
+import io.fabric8.kubernetes.api.model.GenericKubernetesResourceList;
+import io.fabric8.kubernetes.api.model.ObjectMeta;
 import io.fabric8.kubernetes.api.model.ServiceAccount;
-import io.fabric8.kubernetes.api.model.ServiceAccountBuilder;
+import io.fabric8.kubernetes.api.model.ServiceAccountList;
 import io.fabric8.kubernetes.api.model.rbac.RoleBinding;
-import io.fabric8.kubernetes.api.model.rbac.RoleBindingBuilder;
+import io.fabric8.kubernetes.api.model.rbac.RoleBindingList;
 import io.fabric8.kubernetes.client.KubernetesClient;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
-import org.springframework.stereotype.Service;
+import io.fabric8.kubernetes.client.dsl.MixedOperation;
+import io.fabric8.kubernetes.client.dsl.RbacAPIGroupDSL;
+import io.fabric8.kubernetes.client.dsl.Resource;
+import io.fabric8.kubernetes.client.dsl.ServiceAccountResource;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Captor;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
 
-import java.util.*;
+import java.util.List;
+import java.util.Map;
 
-/**
- * Argo Workflow implementation of the WorkflowEngine interface.
- * Creates Argo Workflow resources in Kubernetes to run automated tests.
- * 
- * Enable this engine by setting: workflow.engine=argo
- */
-@Service
-@ConditionalOnProperty(name = "workflow.engine", havingValue = "argo")
-public class ArgoWorkflowEngine implements WorkflowEngine {
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.*;
 
-    private static final Logger log = LoggerFactory.getLogger(ArgoWorkflowEngine.class);
+@ExtendWith(MockitoExtension.class)
+@DisplayName("ArgoWorkflowEngine Tests")
+class ArgoWorkflowEngineTest {
 
-    private static final String ARGO_API_VERSION = "argoproj.io/v1alpha1";
-    private static final String ARGO_WORKFLOW_KIND = "Workflow";
-    private static final String WORKFLOW_LABEL_TESTFLIGHT = "testing.jugash.com/testflight";
-    private static final String WORKFLOW_LABEL_MANAGED_BY = "app.kubernetes.io/managed-by";
+    @Mock
+    private KubernetesClient client;
 
-    private final KubernetesClient client;
-    private final com.fasterxml.jackson.databind.ObjectMapper objectMapper;
+    @Mock
+    private MixedOperation<GenericKubernetesResource, GenericKubernetesResourceList, Resource<GenericKubernetesResource>> genericOperation;
 
-    public ArgoWorkflowEngine(KubernetesClient client) {
-        this.client = client;
-        this.objectMapper = new com.fasterxml.jackson.databind.ObjectMapper();
-        log.info("ArgoWorkflowEngine initialized - Argo Workflows integration enabled");
+    @Mock
+    private Resource<GenericKubernetesResource> genericResource;
+
+    @Mock
+    private MixedOperation<ServiceAccount, ServiceAccountList, ServiceAccountResource> serviceAccountOperation;
+
+    @Mock
+    private ServiceAccountResource serviceAccountResource;
+
+    @Mock
+    private RbacAPIGroupDSL rbac;
+
+    @Mock
+    private MixedOperation<RoleBinding, RoleBindingList, Resource<RoleBinding>> roleBindingOperation;
+
+    @Mock
+    private Resource<RoleBinding> roleBindingResource;
+
+    private ArgoWorkflowEngine engine;
+
+    @Captor
+    private ArgumentCaptor<GenericKubernetesResource> resourceCaptor;
+
+    @BeforeEach
+    void setUp() {
+        engine = new ArgoWorkflowEngine(client);
     }
 
-    @Override
-    public boolean triggerWorkflow(TestFlight testFlight) {
-        String testFlightName = testFlight.getMetadata().getName();
-        String namespace = testFlight.getMetadata().getNamespace();
-        WorkflowConfig workflowConfig = testFlight.getSpec().getWorkflow();
+    @Test
+    @DisplayName("Should trigger workflow creation successfully")
+    void testTriggerWorkflowSuccess() {
+        // Given
+        TestFlight tf = createTestFlight("test-run");
+        setupGenericMocks();
+        setupRbacMocks();
+        when(genericOperation.list()).thenReturn(new GenericKubernetesResourceList()); // Does not exist
+        when(genericOperation.resource(any(GenericKubernetesResource.class))).thenReturn(genericResource);
 
-        if (workflowConfig == null) {
-            log.info("No workflow configuration for TestFlight: {}", testFlightName);
-            return true;
-        }
+        // When
+        boolean result = engine.triggerWorkflow(tf);
 
-        if (workflowConfig.getTemplateName() == null || workflowConfig.getTemplateName().isBlank()) {
-            log.warn("No workflow template specified for TestFlight: {}", testFlightName);
-            return false;
-        }
+        // Then
+        assertTrue(result);
+        verify(genericOperation).resource(resourceCaptor.capture());
+        GenericKubernetesResource created = resourceCaptor.getValue();
+        assertEquals("Workflow", created.getKind());
+        assertTrue(created.getMetadata().getName().startsWith("test-run-"));
+        assertEquals("test-run", created.getMetadata().getLabels().get("testing.jugash.com/testflight"));
 
-        // Check if workflow already exists for this TestFlight
-        if (resourceExistsForTestFlight(namespace, testFlightName, ARGO_WORKFLOW_KIND)) {
-            log.info("Workflow already exists for TestFlight: {}", testFlightName);
-            return true;
-        }
-
-        try {
-            // Ensure RBAC is set up (ServiceAccount + RoleBindings)
-            ensureRbac(testFlight, namespace);
-
-            GenericKubernetesResource workflow = buildWorkflow(testFlight, workflowConfig);
-            client.genericKubernetesResources(ARGO_API_VERSION, ARGO_WORKFLOW_KIND)
-                    .inNamespace(namespace)
-                    .resource(workflow)
-                    .create();
-
-            log.info("Created Argo Workflow '{}' for TestFlight: {}",
-                    workflow.getMetadata().getName(), testFlightName);
-            return true;
-
-        } catch (Exception e) {
-            log.error("Failed to create Argo Workflow for TestFlight: {}", testFlightName, e);
-            return false;
-        }
+        Map<String, Object> spec = (Map<String, Object>) created.getAdditionalProperties().get("spec");
+        assertNotNull(spec);
+        Map<String, Object> templateRef = (Map<String, Object>) spec.get("workflowTemplateRef");
+        assertEquals("basic-test", templateRef.get("name"));
     }
 
-    @Override
-    public WorkflowStatus getWorkflowStatus(TestFlight testFlight) {
-        String testFlightName = testFlight.getMetadata().getName();
-        String namespace = testFlight.getMetadata().getNamespace();
+    @Test
+    @DisplayName("Should skip creation if workflow already exists")
+    void testSkipIfExists() {
+        // Given
+        TestFlight tf = createTestFlight("test-run");
+        setupGenericMocks();
+        GenericKubernetesResource existing = new GenericKubernetesResource();
+        existing.setMetadata(new ObjectMeta());
+        existing.getMetadata().setName("existing-workflow");
 
-        try {
-            // Check for Workflow
-            var workflows = client.genericKubernetesResources(ARGO_API_VERSION, ARGO_WORKFLOW_KIND)
-                    .inNamespace(namespace)
-                    .withLabel(WORKFLOW_LABEL_TESTFLIGHT, testFlightName)
-                    .list();
+        when(genericOperation.list()).thenReturn(createList(existing));
 
-            if (!workflows.getItems().isEmpty()) {
-                GenericKubernetesResource workflow = workflows.getItems().get(0);
-                Map<String, Object> status = (Map<String, Object>) workflow.getAdditionalProperties().get("status");
+        // When
+        boolean result = engine.triggerWorkflow(tf);
 
-                if (status == null) {
-                    return WorkflowStatus.running("Workflow starting...");
-                }
-
-                String phase = (String) status.get("phase");
-                String message = (String) status.getOrDefault("message", "");
-
-                return switch (phase) {
-                    case "Succeeded" -> WorkflowStatus.succeeded(message);
-                    case "Failed", "Error" -> WorkflowStatus.failed(message);
-                    default -> WorkflowStatus.running(phase + ": " + message);
-                };
-            }
-
-            return null;
-
-        } catch (Exception e) {
-            log.warn("Error checking workflow status for TestFlight {}: {}", testFlightName, e.getMessage());
-            return null;
-        }
+        // Then
+        assertTrue(result);
+        verify(genericOperation, never()).resource(any(GenericKubernetesResource.class));
     }
 
-    @Override
-    public boolean cancelWorkflow(TestFlight testFlight) {
-        String testFlightName = testFlight.getMetadata().getName();
-        String namespace = testFlight.getMetadata().getNamespace();
+    @Test
+    @DisplayName("Should return null status if no workflow found")
+    void testStatusNotFound() {
+        // Given
+        TestFlight tf = createTestFlight("test-run");
+        setupGenericMocks();
+        when(genericOperation.list()).thenReturn(new GenericKubernetesResourceList());
 
-        try {
-            // Cancel Workflows
-            var workflows = client.genericKubernetesResources(ARGO_API_VERSION, ARGO_WORKFLOW_KIND)
-                    .inNamespace(namespace)
-                    .withLabel(WORKFLOW_LABEL_TESTFLIGHT, testFlightName)
-                    .list();
+        // When
+        WorkflowEngine.WorkflowStatus status = engine.getWorkflowStatus(tf);
 
-            if (!workflows.getItems().isEmpty()) {
-                for (GenericKubernetesResource workflow : workflows.getItems()) {
-                    terminateWorkflow(workflow, namespace, testFlightName);
-                }
-            }
-
-            return true;
-
-        } catch (Exception e) {
-            log.error("Error cancelling workflow for TestFlight {}: {}", testFlightName, e.getMessage(), e);
-            return false;
-        }
+        // Then
+        assertNull(status);
     }
 
-    private void terminateWorkflow(GenericKubernetesResource workflow, String namespace, String testFlightName) {
-        String workflowName = workflow.getMetadata().getName();
-        // Argo Workflows can be stopped by setting spec.shutdown = "Terminate"
-        Map<String, Object> spec = (Map<String, Object>) workflow.getAdditionalProperties().get("spec");
-        if (spec == null) {
-            spec = new LinkedHashMap<>();
-        }
-        spec.put("shutdown", "Terminate");
-        workflow.getAdditionalProperties().put("spec", spec);
+    @Test
+    @DisplayName("Should return status when workflow exists")
+    void testGetStatus() {
+        // Given
+        TestFlight tf = createTestFlight("test-run");
+        setupGenericMocks();
 
-        client.genericKubernetesResources(ARGO_API_VERSION, ARGO_WORKFLOW_KIND)
-                .inNamespace(namespace)
-                .resource(workflow)
-                .patch();
+        GenericKubernetesResource workflow = new GenericKubernetesResource();
+        workflow.setAdditionalProperties(Map.of("status", Map.of("phase", "Running", "message", "Step 1")));
+        when(genericOperation.list()).thenReturn(createList(workflow));
 
-        log.info("Terminated Argo Workflow '{}' for TestFlight: {}", workflowName, testFlightName);
+        // When
+        WorkflowEngine.WorkflowStatus status = engine.getWorkflowStatus(tf);
+
+        // Then
+        assertNotNull(status);
+        assertFalse(status.isComplete());
+        assertTrue(status.message().contains("Running"));
     }
 
-    private boolean resourceExistsForTestFlight(String namespace, String testFlightName, String kind) {
-        try {
-            var resources = client.genericKubernetesResources(ARGO_API_VERSION, kind)
-                    .inNamespace(namespace)
-                    .withLabel(WORKFLOW_LABEL_TESTFLIGHT, testFlightName)
-                    .list();
-            return !resources.getItems().isEmpty();
-        } catch (Exception e) {
-            log.debug("Could not check for existing {}: {}", kind, e.getMessage());
-            return false;
-        }
+    @Test
+    @DisplayName("Should cancel running workflow")
+    void testCancelWorkflow() {
+        // Given
+        TestFlight tf = createTestFlight("test-run");
+        setupGenericMocks();
+
+        GenericKubernetesResource workflow = new GenericKubernetesResource();
+        workflow.setMetadata(new ObjectMeta());
+        workflow.getMetadata().setName("wf-1");
+        // Mutable map for props
+        workflow.setAdditionalProperties(new java.util.HashMap<>());
+
+        when(genericOperation.list())
+                .thenReturn(createList(workflow))
+                .thenReturn(new GenericKubernetesResourceList());
+        when(genericOperation.resource(any(GenericKubernetesResource.class))).thenReturn(genericResource);
+
+        // When
+        boolean result = engine.cancelWorkflow(tf);
+
+        // Then
+        assertTrue(result);
+        verify(genericOperation).resource(resourceCaptor.capture());
+        GenericKubernetesResource patched = resourceCaptor.getValue();
+
+        Map<String, Object> spec = (Map<String, Object>) patched.getAdditionalProperties().get("spec");
+        assertEquals("Terminate", spec.get("shutdown"));
     }
 
-    private GenericKubernetesResource buildWorkflow(TestFlight testFlight, WorkflowConfig config) {
-        String testFlightName = testFlight.getMetadata().getName();
-        String workflowName = generateWorkflowName(testFlightName);
-        String saName = testFlightName + "-sa";
+    @Test
+    @DisplayName("Should handle missing config gracefully")
+    void testMissingConfig() {
+        TestFlight tf = createTestFlight("no-config");
+        tf.getSpec().setWorkflow(null);
 
-        Map<String, Object> spec = new LinkedHashMap<>();
-        spec.put("workflowTemplateRef", Map.of("name", config.getTemplateName()));
-        spec.put("serviceAccountName", saName);
+        boolean result = engine.triggerWorkflow(tf);
 
-        List<Map<String, Object>> parameters = buildParameters(testFlight, config);
-        if (!parameters.isEmpty()) {
-            spec.put("arguments", Map.of("parameters", parameters));
-        }
-
-        // Build labels - start with defaults, then add user-provided
-        Map<String, String> labels = new LinkedHashMap<>();
-        labels.put(WORKFLOW_LABEL_TESTFLIGHT, testFlightName);
-        labels.put(WORKFLOW_LABEL_MANAGED_BY, "testflight-operator");
-        if (config.getLabels() != null) {
-            labels.putAll(config.getLabels());
-        }
-
-        // Build annotations
-        Map<String, String> annotations = new LinkedHashMap<>();
-        if (config.getAnnotations() != null) {
-            annotations.putAll(config.getAnnotations());
-        }
-
-        var metadataBuilder = new GenericKubernetesResourceBuilder()
-                .withApiVersion(ARGO_API_VERSION)
-                .withKind(ARGO_WORKFLOW_KIND)
-                .withNewMetadata()
-                .withName(workflowName)
-                .withNamespace(testFlight.getMetadata().getNamespace())
-                .withLabels(labels);
-
-        if (!annotations.isEmpty()) {
-            metadataBuilder.withAnnotations(annotations);
-        }
-
-        return metadataBuilder
-                .addToOwnerReferences(createOwnerReference(testFlight))
-                .endMetadata()
-                .withAdditionalProperties(Map.of("spec", spec))
-                .build();
+        assertTrue(result);
+        verifyNoInteractions(client);
     }
 
-    private String generateWorkflowName(String testFlightName) {
-        String suffix = UUID.randomUUID().toString().substring(0, 8);
-        String baseName = testFlightName.length() > 50
-                ? testFlightName.substring(0, 50)
-                : testFlightName;
-        return String.format("%s-%s", baseName, suffix);
+    @Test
+    @DisplayName("Should fail validation for missing template name")
+    void testMissingTemplate() {
+        TestFlight tf = createTestFlight("no-template");
+        tf.getSpec().getWorkflow().setTemplateName(null);
+
+        boolean result = engine.triggerWorkflow(tf);
+
+        assertFalse(result);
+        verifyNoInteractions(client);
     }
 
-    private List<Map<String, Object>> buildParameters(TestFlight testFlight, WorkflowConfig config) {
-        List<Map<String, Object>> params = new ArrayList<>();
+    @Test
+    @DisplayName("Should handle workflow creation failure")
+    void testCreationFailure() {
+        TestFlight tf = createTestFlight("fail-create");
+        setupGenericMocks();
+        setupRbacMocks();
+        when(genericOperation.list()).thenReturn(new GenericKubernetesResourceList());
+        when(genericOperation.resource(any(GenericKubernetesResource.class)))
+                .thenThrow(new RuntimeException("API Error"));
 
-        // Pass the TestFlight name so the workflow knows the prefix for namespaces
-        params.add(Map.of("name", "testflight_name", "value", testFlight.getMetadata().getName()));
+        boolean result = engine.triggerWorkflow(tf);
 
-        if (config.getApplications() != null && !config.getApplications().isEmpty()) {
-            try {
-                String appsJson = objectMapper.writeValueAsString(config.getApplications());
-                params.add(Map.of("name", "applications", "value", appsJson));
-            } catch (Exception e) {
-                log.error("Failed to serialize applications", e);
-            }
+        assertFalse(result);
+    }
+
+    @Test
+    @DisplayName("Should handle check existing workflow failure")
+    void testCheckExistingFailure() {
+        TestFlight tf = createTestFlight("fail-check");
+        setupGenericMocks();
+        setupRbacMocks();
+        when(genericOperation.list()).thenThrow(new RuntimeException("API Error"));
+
+        // If check fails, it assumes false (not existing) and tries to create
+        // But create might also fail if API is down, or succeed.
+        // Here we just want to verify it swallows the check exception and proceeds or
+        // returns safe.
+        // Code says: "Could not check ... return false". So it proceeds to create.
+
+        when(genericOperation.resource(any(GenericKubernetesResource.class))).thenReturn(genericResource);
+
+        boolean result = engine.triggerWorkflow(tf);
+
+        assertTrue(result);
+        verify(genericResource).create();
+    }
+
+    @Test
+    @DisplayName("Should handle status check failure")
+    void testStatusFailure() {
+        TestFlight tf = createTestFlight("fail-status");
+        setupGenericMocks();
+        when(genericOperation.list()).thenThrow(new RuntimeException("API Error"));
+
+        WorkflowEngine.WorkflowStatus status = engine.getWorkflowStatus(tf);
+
+        assertNull(status);
+    }
+
+    @Test
+    @DisplayName("Should handle cancellation failure")
+    void testCancelFailure() {
+        TestFlight tf = createTestFlight("fail-cancel");
+        setupGenericMocks();
+        when(genericOperation.list()).thenThrow(new RuntimeException("API Error"));
+
+        boolean result = engine.cancelWorkflow(tf);
+
+        assertFalse(result);
+    }
+
+    @Test
+    @DisplayName("Should include parameters in workflow")
+    void testWithParameters() {
+        TestFlight tf = createTestFlight("with-params");
+
+        // Add apps and checks
+        var apps = List.of(new com.example.testflight.crd.ApplicationSpec());
+        tf.getSpec().getWorkflow().setApplications(apps);
+
+        var checks = List.of(new com.example.testflight.crd.CheckSpec());
+        tf.getSpec().getWorkflow().setChecks(checks);
+
+        setupGenericMocks();
+        setupRbacMocks();
+        when(genericOperation.list()).thenReturn(new GenericKubernetesResourceList());
+        when(genericOperation.resource(any(GenericKubernetesResource.class))).thenReturn(genericResource);
+
+        boolean result = engine.triggerWorkflow(tf);
+
+        assertTrue(result);
+        verify(genericOperation).resource(resourceCaptor.capture());
+
+        GenericKubernetesResource created = resourceCaptor.getValue();
+        Map<String, Object> spec = (Map<String, Object>) created.getAdditionalProperties().get("spec");
+        Map<String, Object> args = (Map<String, Object>) spec.get("arguments");
+        List<Map<String, Object>> params = (List<Map<String, Object>>) args.get("parameters");
+
+        assertEquals(3, params.size());
+    }
+
+    // Helper methods
+
+    private void setupGenericMocks() {
+        when(client.genericKubernetesResources(anyString(), anyString())).thenReturn(genericOperation);
+        when(genericOperation.inNamespace(anyString())).thenReturn(genericOperation);
+        when(genericOperation.withLabel(anyString(), anyString())).thenReturn(genericOperation);
+    }
+
+    private void setupRbacMocks() {
+        // Setup ServiceAccount mocks - always needed for workflow creation
+        when(client.serviceAccounts()).thenReturn(serviceAccountOperation);
+        when(serviceAccountOperation.inNamespace(anyString())).thenReturn(serviceAccountOperation);
+        when(serviceAccountOperation.resource(any(ServiceAccount.class)))
+                .thenReturn(serviceAccountResource);
+        // Note: RoleBinding mocks are only needed if TestFlight has namespaces
+        // configured
+    }
+
+    private GenericKubernetesResourceList createList(GenericKubernetesResource... resources) {
+        GenericKubernetesResourceList list = new GenericKubernetesResourceList();
+        if (resources != null) {
+            list.setItems(List.of(resources));
         }
-
-        if (config.getChecks() != null && !config.getChecks().isEmpty()) {
-            try {
-                String checksJson = objectMapper.writeValueAsString(config.getChecks());
-                params.add(Map.of("name", "checks", "value", checksJson));
-            } catch (Exception e) {
-                log.error("Failed to serialize checks", e);
-            }
-        }
-
-        return params;
+        return list;
     }
 
-    private void ensureRbac(TestFlight testFlight, String namespace) {
-        String testFlightName = testFlight.getMetadata().getName();
-        String saName = testFlightName + "-sa";
+    private TestFlight createTestFlight(String name) {
+        TestFlight tf = new TestFlight();
+        ObjectMeta meta = new ObjectMeta();
+        meta.setName(name);
+        meta.setNamespace("default");
+        meta.setUid("uid-" + name);
+        tf.setMetadata(meta);
+        tf.setApiVersion("testing.jugash.com/v1");
+        tf.setKind("TestFlight");
 
-        // 1. Create ServiceAccount
-        ServiceAccount sa = new ServiceAccountBuilder()
-                .withNewMetadata()
-                .withName(saName)
-                .withNamespace(namespace)
-                .addToLabels(WORKFLOW_LABEL_TESTFLIGHT, testFlightName)
-                .addToOwnerReferences(createOwnerReference(testFlight))
-                .endMetadata()
-                .build();
-        client.serviceAccounts().inNamespace(namespace).resource(sa).createOrReplace();
+        TestFlightSpec spec = new TestFlightSpec();
+        WorkflowConfig config = new WorkflowConfig();
+        config.setTemplateName("basic-test");
+        spec.setWorkflow(config);
+        tf.setSpec(spec);
 
-        // 2. Create RoleBindings in each target namespace
-        List<NamespaceConfig> namespaceConfigs = testFlight.getSpec().getNamespaces();
-        if (namespaceConfigs != null) {
-            for (NamespaceConfig nsConfig : namespaceConfigs) {
-                // Assuming naming convention: {testFlightName}-{nsConfigName}
-                String targetNs = testFlightName + "-" + nsConfig.getName();
-
-                RoleBinding rb = new RoleBindingBuilder()
-                        .withNewMetadata()
-                        .withName(testFlightName + "-admin-binding") // Unique binding name
-                        .withNamespace(targetNs)
-                        .addToLabels(WORKFLOW_LABEL_TESTFLIGHT, testFlightName)
-                        .endMetadata()
-                        .addNewSubject()
-                        .withKind("ServiceAccount")
-                        .withName(saName)
-                        .withNamespace(namespace)
-                        .endSubject()
-                        .withNewRoleRef()
-                        .withKind("ClusterRole")
-                        .withName("admin") // Using 'admin' for full control within namespace
-                        .withApiGroup("rbac.authorization.k8s.io")
-                        .endRoleRef()
-                        .build();
-
-                try {
-                    client.rbac().roleBindings().inNamespace(targetNs).resource(rb).createOrReplace();
-                    log.info("Created RoleBinding in {} for ServiceAccount {}", targetNs, saName);
-                } catch (Exception e) {
-                    log.warn("Failed to create RoleBinding in {}: {}", targetNs, e.getMessage());
-                }
-            }
-        }
+        return tf;
     }
 
-    private OwnerReference createOwnerReference(TestFlight testFlight) {
-        return new OwnerReferenceBuilder()
-                .withApiVersion(testFlight.getApiVersion())
-                .withKind(testFlight.getKind())
-                .withName(testFlight.getMetadata().getName())
-                .withUid(testFlight.getMetadata().getUid())
-                .withController(true)
-                .withBlockOwnerDeletion(true)
-                .build();
+    @Test
+    @DisplayName("Should merge custom labels and annotations")
+    void testCustomLabelsAndAnnotations() {
+        TestFlight tf = createTestFlight("custom-meta");
+        tf.getSpec().getWorkflow().setLabels(Map.of("team", "platform"));
+        tf.getSpec().getWorkflow().setAnnotations(Map.of("description", "CI run"));
+
+        setupGenericMocks();
+        setupRbacMocks();
+        when(genericOperation.list()).thenReturn(new GenericKubernetesResourceList());
+        when(genericOperation.resource(any(GenericKubernetesResource.class))).thenReturn(genericResource);
+
+        engine.triggerWorkflow(tf);
+
+        verify(genericOperation).resource(resourceCaptor.capture());
+        GenericKubernetesResource created = resourceCaptor.getValue();
+
+        Map<String, String> labels = created.getMetadata().getLabels();
+        assertEquals("platform", labels.get("team"));
+        assertEquals("testflight-operator", labels.get("app.kubernetes.io/managed-by"));
+
+        Map<String, String> annotations = created.getMetadata().getAnnotations();
+        assertEquals("CI run", annotations.get("description"));
     }
+
+    @Test
+    @DisplayName("Should return starting status when workflow status is missing")
+    void testStatusMissingStatusObject() {
+        TestFlight tf = createTestFlight("no-status");
+        setupGenericMocks();
+
+        GenericKubernetesResource workflow = new GenericKubernetesResource();
+        workflow.setAdditionalProperties(Map.of()); // No "status" field
+        when(genericOperation.list()).thenReturn(createList(workflow));
+
+        WorkflowEngine.WorkflowStatus status = engine.getWorkflowStatus(tf);
+
+        assertNotNull(status);
+        assertFalse(status.isComplete());
+        assertTrue(status.message().contains("starting"));
+    }
+
+    @Test
+    @DisplayName("Should handle unknown phases as running")
+    void testUnknownPhase() {
+        TestFlight tf = createTestFlight("unknown-phase");
+        setupGenericMocks();
+
+        GenericKubernetesResource workflow = new GenericKubernetesResource();
+        workflow.setAdditionalProperties(Map.of("status", Map.of("phase", "Pending", "message", "Waiting for pod")));
+        when(genericOperation.list()).thenReturn(createList(workflow));
+
+        WorkflowEngine.WorkflowStatus status = engine.getWorkflowStatus(tf);
+
+        assertNotNull(status);
+        assertFalse(status.isComplete());
+        assertTrue(status.message().contains("Pending"));
+    }
+
+    @Test
+    @DisplayName("Should handle Succeeded phase")
+    void testStatusSucceeded() {
+        TestFlight tf = createTestFlight("succeeded-tf");
+        setupGenericMocks();
+
+        GenericKubernetesResource workflow = new GenericKubernetesResource();
+        workflow.setAdditionalProperties(Map.of("status", Map.of("phase", "Succeeded", "message", "Done")));
+        when(genericOperation.list()).thenReturn(createList(workflow));
+
+        WorkflowEngine.WorkflowStatus status = engine.getWorkflowStatus(tf);
+
+        assertNotNull(status);
+        assertTrue(status.isComplete());
+        assertTrue(status.isSucceeded());
+    }
+
+    @Test
+    @DisplayName("Should handle Failed phase")
+    void testStatusFailed() {
+        TestFlight tf = createTestFlight("failed-tf");
+        setupGenericMocks();
+
+        GenericKubernetesResource workflow = new GenericKubernetesResource();
+        workflow.setAdditionalProperties(Map.of("status", Map.of("phase", "Failed", "message", "Oh no")));
+        when(genericOperation.list()).thenReturn(createList(workflow));
+
+        WorkflowEngine.WorkflowStatus status = engine.getWorkflowStatus(tf);
+
+        assertNotNull(status);
+        assertTrue(status.isComplete());
+        assertFalse(status.isSucceeded());
+    }
+
+    @Test
+    @DisplayName("Should return true when cancelling non-existent workflow")
+    void testCancelNotFound() {
+        TestFlight tf = createTestFlight("cancel-missing");
+        setupGenericMocks();
+        when(genericOperation.list()).thenReturn(new GenericKubernetesResourceList());
+
+        boolean result = engine.cancelWorkflow(tf);
+
+        assertTrue(result);
+        verify(genericOperation, never()).resource(any(GenericKubernetesResource.class));
+    }
+
+    @Test
+    @DisplayName("Should handle Error phase as failure")
+    void testStatusError() {
+        TestFlight tf = createTestFlight("error-tf");
+        setupGenericMocks();
+
+        GenericKubernetesResource workflow = new GenericKubernetesResource();
+        workflow.setAdditionalProperties(Map.of("status", Map.of("phase", "Error", "message", "Something broke")));
+        when(genericOperation.list()).thenReturn(createList(workflow));
+
+        WorkflowEngine.WorkflowStatus status = engine.getWorkflowStatus(tf);
+
+        assertNotNull(status);
+        assertTrue(status.isComplete());
+        assertFalse(status.isSucceeded());
+    }
+
+    @Test
+    @DisplayName("Should create spec map if null when cancelling")
+    void testCancelWithNullSpec() {
+        TestFlight tf = createTestFlight("cancel-null-spec");
+        setupGenericMocks();
+
+        GenericKubernetesResource workflow = new GenericKubernetesResource();
+        workflow.setMetadata(new ObjectMeta());
+        workflow.getMetadata().setName("wf-2");
+        // Use mutable map but with no "spec" key
+        java.util.Map<String, Object> props = new java.util.HashMap<>();
+        workflow.setAdditionalProperties(props);
+
+        when(genericOperation.list())
+                .thenReturn(createList(workflow))
+                .thenReturn(new GenericKubernetesResourceList());
+        when(genericOperation.resource(any(GenericKubernetesResource.class))).thenReturn(genericResource);
+
+        boolean result = engine.cancelWorkflow(tf);
+
+        assertTrue(result);
+        verify(genericOperation).resource(resourceCaptor.capture());
+        GenericKubernetesResource patched = resourceCaptor.getValue();
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> spec = (Map<String, Object>) patched.getAdditionalProperties().get("spec");
+        assertNotNull(spec);
+        assertEquals("Terminate", spec.get("shutdown"));
+    }
+
+    @Test
+    @DisplayName("Should return false for blank template name")
+    void testBlankTemplateName() {
+        TestFlight tf = createTestFlight("blank-template");
+        WorkflowConfig config = new WorkflowConfig();
+        config.setTemplateName("   "); // Blank, not null
+        tf.getSpec().setWorkflow(config);
+
+        boolean result = engine.triggerWorkflow(tf);
+
+        assertFalse(result);
+    }
+
+    @Test
+    @DisplayName("Should handle default phase in switch")
+    void testDefaultPhase() {
+        TestFlight tf = createTestFlight("default-phase");
+        setupGenericMocks();
+
+        GenericKubernetesResource workflow = new GenericKubernetesResource();
+        workflow.setAdditionalProperties(Map.of("status", Map.of("phase", "Pending", "message", "initializing")));
+        when(genericOperation.list()).thenReturn(createList(workflow));
+
+        WorkflowEngine.WorkflowStatus status = engine.getWorkflowStatus(tf);
+
+        assertNotNull(status);
+        assertFalse(status.isComplete());
+        assertTrue(status.message().contains("Pending"));
+    }
+
 }
