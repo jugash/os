@@ -1,77 +1,57 @@
-apiVersion: kyverno.io/v2
-kind: ClusterPolicy
-metadata:
-  name: enforce-whitelisted-images
-spec:
-  validationFailureAction: Enforce
-  failurePolicy: Ignore
-  background: false
+                if (ns.getResourceQuotas() != null) {
+                    values.append("    resourceQuota:\n");
+                    var quota = ns.getResourceQuotas();
 
-  rules:
-    - name: whitelist-images
-      match:
-        resources:
-          kinds:
-            - Pod
-      context:
-        - name: allowedRegistries
-          configMap:
-            name: allowed-registries
-            namespace: kyverno
-      validate:
-        message: "Container image is not from a whitelisted registry or organization."
+                    if (quota.getPods() != null) {
+                        values.append("      pods: ").append(quota.getPods()).append("\n");
+                    }
+                    if (quota.getRequests() != null && !quota.getRequests().isEmpty()) {
+                        values.append("      requests:\n");
+                        quota.getRequests().forEach(
+                                (k, v) -> values.append("        ").append(k).append(": ").append(v).append("\n"));
+                    }
+                    if (quota.getLimits() != null && !quota.getLimits().isEmpty()) {
+                        values.append("      limits:\n");
+                        quota.getLimits().forEach(
+                                (k, v) -> values.append("        ").append(k).append(": ").append(v).append("\n"));
+                    }
+                }
 
-        foreach:
-          - list: "images.containers"
-            preconditions:
-              any:
-                # Skip internal images
-                - key: "{{ element.registry }}"
-                  operator: Equals
-                  value: "registry.mycorp.io"
-            deny:
-              conditions:
-                all:
-                  # Deny if registry is not in whitelist
-                  - key: "{{ element.registry }}"
-                    operator: NotIn
-                    value: "{{ parse_yaml(allowedRegistries.data.registries) | keys }}"
 
-                  # Deny if org is not allowed for the registry
-                  - key: "{{ element.repository.split('/')[0] || 'library' }}"
-                    operator: NotIn
-                    value: "{{ parse_yaml(allowedRegistries.data.registries)[element.registry || 'docker.io'] }}"
+ @Test
+        @DisplayName("Should include resource quotas in Helm values")
+        void testResourceQuotaSerialization() {
+            // Given
+            TestFlight tf = createTestFlight("quota-test", "alpha");
+            com.example.testflight.crd.QuotaConfig quota = new com.example.testflight.crd.QuotaConfig();
+            quota.setPods("10");
+            quota.setRequests(Map.of("cpu", "1", "memory", "1Gi"));
+            quota.setLimits(Map.of("cpu", "2", "memory", "2Gi"));
 
-          # Repeat for initContainers
-          - list: "images.initContainers"
-            preconditions:
-              any:
-                - key: "{{ element.registry }}"
-                  operator: Equals
-                  value: "registry.mycorp.io"
-            deny:
-              conditions:
-                all:
-                  - key: "{{ element.registry }}"
-                    operator: NotIn
-                    value: "{{ parse_yaml(allowedRegistries.data.registries) | keys }}"
-                  - key: "{{ element.repository.split('/')[0] || 'library' }}"
-                    operator: NotIn
-                    value: "{{ parse_yaml(allowedRegistries.data.registries)[element.registry || 'docker.io'] }}"
+            tf.getSpec().getNamespaces().get(0).setResourceQuotas(quota);
 
-          # Repeat for ephemeralContainers
-          - list: "images.ephemeralContainers"
-            preconditions:
-              any:
-                - key: "{{ element.registry }}"
-                  operator: Equals
-                  value: "registry.mycorp.io"
-            deny:
-              conditions:
-                all:
-                  - key: "{{ element.registry }}"
-                    operator: NotIn
-                    value: "{{ parse_yaml(allowedRegistries.data.registries) | keys }}"
-                  - key: "{{ element.repository.split('/')[0] || 'library' }}"
-                    operator: NotIn
-                    value: "{{ parse_yaml(allowedRegistries.data.registries)[element.registry || 'docker.io'] }}"
+            setupMocks();
+            when(genericResource.get()).thenReturn(null);
+            when(genericOperation.resource(any(GenericKubernetesResource.class))).thenReturn(genericResource);
+
+            // When
+            engine.triggerWorkflow(tf);
+
+            // Then
+            verify(genericOperation).resource(resourceCaptor.capture());
+            GenericKubernetesResource app = resourceCaptor.getValue();
+
+            @SuppressWarnings("unchecked")
+            Map<String, Object> spec = (Map<String, Object>) app.getAdditionalProperties().get("spec");
+            @SuppressWarnings("unchecked")
+            Map<String, Object> source = (Map<String, Object>) spec.get("source");
+            @SuppressWarnings("unchecked")
+            Map<String, Object> helm = (Map<String, Object>) source.get("helm");
+            String values = (String) helm.get("values");
+
+            assertTrue(values.contains("resourceQuota:"));
+            assertTrue(values.contains("pods: 10"));
+            assertTrue(values.contains("cpu: 1"));
+            assertTrue(values.contains("memory: 1Gi"));
+        }
+    }
