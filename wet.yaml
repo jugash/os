@@ -1,529 +1,349 @@
-package com.example.testflight.workflow;
-
-import com.example.testflight.crd.TestFlight;
-import com.example.testflight.crd.TestFlightSpec;
-
-import com.example.testflight.crd.WorkflowConfig;
-import io.fabric8.kubernetes.api.model.GenericKubernetesResource;
-import io.fabric8.kubernetes.api.model.GenericKubernetesResourceList;
-import io.fabric8.kubernetes.api.model.ObjectMeta;
-import io.fabric8.kubernetes.api.model.ServiceAccount;
-import io.fabric8.kubernetes.api.model.ServiceAccountList;
-import io.fabric8.kubernetes.api.model.rbac.RoleBinding;
-import io.fabric8.kubernetes.api.model.rbac.RoleBindingList;
-import io.fabric8.kubernetes.client.KubernetesClient;
-import io.fabric8.kubernetes.client.dsl.MixedOperation;
-import io.fabric8.kubernetes.client.dsl.RbacAPIGroupDSL;
-import io.fabric8.kubernetes.client.dsl.Resource;
-import io.fabric8.kubernetes.client.dsl.ServiceAccountResource;
-import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.DisplayName;
-import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.ArgumentCaptor;
-import org.mockito.Captor;
-import org.mockito.Mock;
-import org.mockito.junit.jupiter.MockitoExtension;
-
-import java.util.List;
-import java.util.Map;
-
-import static org.junit.jupiter.api.Assertions.*;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.Mockito.*;
-
-@ExtendWith(MockitoExtension.class)
-@DisplayName("ArgoWorkflowEngine Tests")
-class ArgoWorkflowEngineTest {
-
-    @Mock
-    private KubernetesClient client;
-
-    @Mock
-    private MixedOperation<GenericKubernetesResource, GenericKubernetesResourceList, Resource<GenericKubernetesResource>> genericOperation;
-
-    @Mock
-    private Resource<GenericKubernetesResource> genericResource;
-
-    @Mock
-    private MixedOperation<ServiceAccount, ServiceAccountList, ServiceAccountResource> serviceAccountOperation;
-
-    @Mock
-    private ServiceAccountResource serviceAccountResource;
-
-    @Mock
-    private RbacAPIGroupDSL rbac;
-
-    @Mock
-    private MixedOperation<RoleBinding, RoleBindingList, Resource<RoleBinding>> roleBindingOperation;
-
-    @Mock
-    private Resource<RoleBinding> roleBindingResource;
-
-    private ArgoWorkflowEngine engine;
-
-    @Captor
-    private ArgumentCaptor<GenericKubernetesResource> resourceCaptor;
-
-    @BeforeEach
-    void setUp() {
-        engine = new ArgoWorkflowEngine(client);
-    }
-
-    @Test
-    @DisplayName("Should trigger workflow creation successfully")
-    void testTriggerWorkflowSuccess() {
-        // Given
-        TestFlight tf = createTestFlight("test-run");
-        setupGenericMocks();
-        setupRbacMocks();
-        when(genericOperation.list()).thenReturn(new GenericKubernetesResourceList()); // Does not exist
-        when(genericOperation.resource(any(GenericKubernetesResource.class))).thenReturn(genericResource);
-
-        // When
-        boolean result = engine.triggerWorkflow(tf);
-
-        // Then
-        assertTrue(result);
-        verify(genericOperation).resource(resourceCaptor.capture());
-        GenericKubernetesResource created = resourceCaptor.getValue();
-        assertEquals("Workflow", created.getKind());
-        assertTrue(created.getMetadata().getName().startsWith("test-run-"));
-        assertEquals("test-run", created.getMetadata().getLabels().get("testing.jugash.com/testflight"));
-
-        Map<String, Object> spec = (Map<String, Object>) created.getAdditionalProperties().get("spec");
-        assertNotNull(spec);
-        Map<String, Object> templateRef = (Map<String, Object>) spec.get("workflowTemplateRef");
-        assertEquals("basic-test", templateRef.get("name"));
-    }
-
-    @Test
-    @DisplayName("Should skip creation if workflow already exists")
-    void testSkipIfExists() {
-        // Given
-        TestFlight tf = createTestFlight("test-run");
-        setupGenericMocks();
-        GenericKubernetesResource existing = new GenericKubernetesResource();
-        existing.setMetadata(new ObjectMeta());
-        existing.getMetadata().setName("existing-workflow");
-
-        when(genericOperation.list()).thenReturn(createList(existing));
-
-        // When
-        boolean result = engine.triggerWorkflow(tf);
-
-        // Then
-        assertTrue(result);
-        verify(genericOperation, never()).resource(any(GenericKubernetesResource.class));
-    }
-
-    @Test
-    @DisplayName("Should return null status if no workflow found")
-    void testStatusNotFound() {
-        // Given
-        TestFlight tf = createTestFlight("test-run");
-        setupGenericMocks();
-        when(genericOperation.list()).thenReturn(new GenericKubernetesResourceList());
-
-        // When
-        WorkflowEngine.WorkflowStatus status = engine.getWorkflowStatus(tf);
-
-        // Then
-        assertNull(status);
-    }
-
-    @Test
-    @DisplayName("Should return status when workflow exists")
-    void testGetStatus() {
-        // Given
-        TestFlight tf = createTestFlight("test-run");
-        setupGenericMocks();
-
-        GenericKubernetesResource workflow = new GenericKubernetesResource();
-        workflow.setAdditionalProperties(Map.of("status", Map.of("phase", "Running", "message", "Step 1")));
-        when(genericOperation.list()).thenReturn(createList(workflow));
-
-        // When
-        WorkflowEngine.WorkflowStatus status = engine.getWorkflowStatus(tf);
-
-        // Then
-        assertNotNull(status);
-        assertFalse(status.isComplete());
-        assertTrue(status.message().contains("Running"));
-    }
-
-    @Test
-    @DisplayName("Should cancel running workflow")
-    void testCancelWorkflow() {
-        // Given
-        TestFlight tf = createTestFlight("test-run");
-        setupGenericMocks();
-
-        GenericKubernetesResource workflow = new GenericKubernetesResource();
-        workflow.setMetadata(new ObjectMeta());
-        workflow.getMetadata().setName("wf-1");
-        // Mutable map for props
-        workflow.setAdditionalProperties(new java.util.HashMap<>());
-
-        when(genericOperation.list())
-                .thenReturn(createList(workflow))
-                .thenReturn(new GenericKubernetesResourceList());
-        when(genericOperation.resource(any(GenericKubernetesResource.class))).thenReturn(genericResource);
-
-        // When
-        boolean result = engine.cancelWorkflow(tf);
-
-        // Then
-        assertTrue(result);
-        verify(genericOperation).resource(resourceCaptor.capture());
-        GenericKubernetesResource patched = resourceCaptor.getValue();
-
-        Map<String, Object> spec = (Map<String, Object>) patched.getAdditionalProperties().get("spec");
-        assertEquals("Terminate", spec.get("shutdown"));
-    }
-
-    @Test
-    @DisplayName("Should handle missing config gracefully")
-    void testMissingConfig() {
-        TestFlight tf = createTestFlight("no-config");
-        tf.getSpec().setWorkflow(null);
-
-        boolean result = engine.triggerWorkflow(tf);
-
-        assertTrue(result);
-        verifyNoInteractions(client);
-    }
-
-    @Test
-    @DisplayName("Should fail validation for missing template name")
-    void testMissingTemplate() {
-        TestFlight tf = createTestFlight("no-template");
-        tf.getSpec().getWorkflow().setTemplateName(null);
-
-        boolean result = engine.triggerWorkflow(tf);
-
-        assertFalse(result);
-        verifyNoInteractions(client);
-    }
-
-    @Test
-    @DisplayName("Should handle workflow creation failure")
-    void testCreationFailure() {
-        TestFlight tf = createTestFlight("fail-create");
-        setupGenericMocks();
-        setupRbacMocks();
-        when(genericOperation.list()).thenReturn(new GenericKubernetesResourceList());
-        when(genericOperation.resource(any(GenericKubernetesResource.class)))
-                .thenThrow(new RuntimeException("API Error"));
-
-        boolean result = engine.triggerWorkflow(tf);
-
-        assertFalse(result);
-    }
-
-    @Test
-    @DisplayName("Should handle check existing workflow failure")
-    void testCheckExistingFailure() {
-        TestFlight tf = createTestFlight("fail-check");
-        setupGenericMocks();
-        setupRbacMocks();
-        when(genericOperation.list()).thenThrow(new RuntimeException("API Error"));
-
-        // If check fails, it assumes false (not existing) and tries to create
-        // But create might also fail if API is down, or succeed.
-        // Here we just want to verify it swallows the check exception and proceeds or
-        // returns safe.
-        // Code says: "Could not check ... return false". So it proceeds to create.
-
-        when(genericOperation.resource(any(GenericKubernetesResource.class))).thenReturn(genericResource);
-
-        boolean result = engine.triggerWorkflow(tf);
-
-        assertTrue(result);
-        verify(genericResource).create();
-    }
-
-    @Test
-    @DisplayName("Should handle status check failure")
-    void testStatusFailure() {
-        TestFlight tf = createTestFlight("fail-status");
-        setupGenericMocks();
-        when(genericOperation.list()).thenThrow(new RuntimeException("API Error"));
-
-        WorkflowEngine.WorkflowStatus status = engine.getWorkflowStatus(tf);
-
-        assertNull(status);
-    }
-
-    @Test
-    @DisplayName("Should handle cancellation failure")
-    void testCancelFailure() {
-        TestFlight tf = createTestFlight("fail-cancel");
-        setupGenericMocks();
-        when(genericOperation.list()).thenThrow(new RuntimeException("API Error"));
-
-        boolean result = engine.cancelWorkflow(tf);
-
-        assertFalse(result);
-    }
-
-    @Test
-    @DisplayName("Should include parameters in workflow")
-    void testWithParameters() {
-        TestFlight tf = createTestFlight("with-params");
-
-        // Add apps and checks
-        var apps = List.of(new com.example.testflight.crd.ApplicationSpec());
-        tf.getSpec().getWorkflow().setApplications(apps);
-
-        var checks = List.of(new com.example.testflight.crd.CheckSpec());
-        tf.getSpec().getWorkflow().setChecks(checks);
-
-        setupGenericMocks();
-        setupRbacMocks();
-        when(genericOperation.list()).thenReturn(new GenericKubernetesResourceList());
-        when(genericOperation.resource(any(GenericKubernetesResource.class))).thenReturn(genericResource);
-
-        boolean result = engine.triggerWorkflow(tf);
-
-        assertTrue(result);
-        verify(genericOperation).resource(resourceCaptor.capture());
-
-        GenericKubernetesResource created = resourceCaptor.getValue();
-        Map<String, Object> spec = (Map<String, Object>) created.getAdditionalProperties().get("spec");
-        Map<String, Object> args = (Map<String, Object>) spec.get("arguments");
-        List<Map<String, Object>> params = (List<Map<String, Object>>) args.get("parameters");
-
-        assertEquals(3, params.size());
-    }
-
-    // Helper methods
-
-    private void setupGenericMocks() {
-        when(client.genericKubernetesResources(anyString(), anyString())).thenReturn(genericOperation);
-        when(genericOperation.inNamespace(anyString())).thenReturn(genericOperation);
-        when(genericOperation.withLabel(anyString(), anyString())).thenReturn(genericOperation);
-    }
-
-    private void setupRbacMocks() {
-        // Setup ServiceAccount mocks - always needed for workflow creation
-        when(client.serviceAccounts()).thenReturn(serviceAccountOperation);
-        when(serviceAccountOperation.inNamespace(anyString())).thenReturn(serviceAccountOperation);
-        when(serviceAccountOperation.resource(any(ServiceAccount.class)))
-                .thenReturn(serviceAccountResource);
-        // Note: RoleBinding mocks are only needed if TestFlight has namespaces
-        // configured
-    }
-
-    private GenericKubernetesResourceList createList(GenericKubernetesResource... resources) {
-        GenericKubernetesResourceList list = new GenericKubernetesResourceList();
-        if (resources != null) {
-            list.setItems(List.of(resources));
+{
+      "annotations": {
+        "list": [
+          {
+            "builtIn": 1,
+            "datasource": {
+              "type": "grafana",
+              "uid": "-- Grafana --"
+            },
+            "enable": true,
+            "hide": true,
+            "iconColor": "rgba(0, 211, 255, 1)",
+            "name": "Annotations & Alerts",
+            "type": "dashboard"
+          }
+        ]
+      },
+      "editable": true,
+      "fiscalYearStartMonth": 0,
+      "graphTooltip": 0,
+      "id": 1,
+      "links": [],
+      "liveNow": false,
+      "panels": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "#e24d42",
+                    "value": null
+                  },
+                  {
+                    "color": "#e24d42",
+                    "value": 0
+                  },
+                  {
+                    "color": "#299c46",
+                    "value": 1
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 0
+          },
+          "id": 1,
+          "options": {
+            "colorMode": "background",
+            "graphMode": "area",
+            "justifyMode": "auto",
+            "orientation": "horizontal",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "text": {},
+            "textMode": "auto"
+          },
+          "pluginVersion": "10.0.3",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "expr": "min(lola_onload_available{cluster=~\"$cluster\"})",
+              "legendFormat": "Node Onload Kernel Module State (0=Missing, 1=Loaded)",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "Onload Kernel Module Availability (Global Minimum)",
+          "type": "stat"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "Count",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "lineInterpolation": "linear",
+                "lineStyle": {
+                  "fill": "solid"
+                },
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "auto",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 0
+          },
+          "id": 2,
+          "options": {
+            "legend": {
+              "calcs": [],
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "single",
+              "sort": "none"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "expr": "sum by (plugin, health) (lola_devices_total{cluster=~\"$cluster\"})",
+              "legendFormat": "{{`{{plugin}}`}} {{`{{health}}`}}",
+              "range": true,
+              "refId": "A"
+            }
+          ],
+          "title": "Healthy vs Unhealthy Devices",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "Allocations / sec",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "lineInterpolation": "linear",
+                "lineStyle": {
+                  "fill": "solid"
+                },
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "auto",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 8
+          },
+          "id": 3,
+          "options": {
+            "legend": {
+              "calcs": [],
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "single",
+              "sort": "none"
+            }
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "expr": "rate(lola_allocations_total{cluster=~\"$cluster\"}[2m])",
+              "legendFormat": "{{`{{plugin}}`}} Success",
+              "range": true,
+              "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "editorMode": "code",
+              "expr": "rate(lola_allocation_errors_total{cluster=~\"$cluster\"}[2m])",
+              "legendFormat": "{{`{{plugin}}`}} Errors",
+              "range": true,
+              "refId": "B"
+            }
+          ],
+          "title": "Allocate() RPC Traffic",
+          "type": "timeseries"
         }
-        return list;
+      ],
+      "schemaVersion": 38,
+      "style": "dark",
+      "tags": [
+        "kubernetes",
+        "device-plugin",
+        "lola"
+      ],
+      "templating": {
+        "list": [
+          {
+            "current": {
+              "selected": false,
+              "text": "Prometheus",
+              "value": "Prometheus"
+            },
+            "hide": 0,
+            "includeAll": false,
+            "multi": false,
+            "name": "datasource",
+            "options": [],
+            "query": "prometheus",
+            "refresh": 1,
+            "regex": "",
+            "skipUrlSync": false,
+            "type": "datasource"
+          },
+          {
+            "datasource": {
+              "type": "prometheus",
+              "uid": "${datasource}"
+            },
+            "hide": 0,
+            "includeAll": true,
+            "multi": true,
+            "name": "cluster",
+            "options": [],
+            "query": {
+              "query": "label_values(lola_devices_total, cluster)",
+              "refId": "StandardVariableQuery"
+            },
+            "refresh": 1,
+            "regex": "",
+            "skipUrlSync": false,
+            "sort": 1,
+            "type": "query"
+          }
+        ]
+      },
+      "time": {
+        "from": "now-30m",
+        "to": "now"
+      },
+      "timepicker": {},
+      "timezone": "",
+      "title": "LOLA Hardware Device Plugin",
+      "uid": "lola-device-plugin-hq",
+      "version": 1,
+      "weekStart": ""
     }
-
-    private TestFlight createTestFlight(String name) {
-        TestFlight tf = new TestFlight();
-        ObjectMeta meta = new ObjectMeta();
-        meta.setName(name);
-        meta.setNamespace("default");
-        meta.setUid("uid-" + name);
-        tf.setMetadata(meta);
-        tf.setApiVersion("testing.jugash.com/v1");
-        tf.setKind("TestFlight");
-
-        TestFlightSpec spec = new TestFlightSpec();
-        WorkflowConfig config = new WorkflowConfig();
-        config.setTemplateName("basic-test");
-        spec.setWorkflow(config);
-        tf.setSpec(spec);
-
-        return tf;
-    }
-
-    @Test
-    @DisplayName("Should merge custom labels and annotations")
-    void testCustomLabelsAndAnnotations() {
-        TestFlight tf = createTestFlight("custom-meta");
-        tf.getSpec().getWorkflow().setLabels(Map.of("team", "platform"));
-        tf.getSpec().getWorkflow().setAnnotations(Map.of("description", "CI run"));
-
-        setupGenericMocks();
-        setupRbacMocks();
-        when(genericOperation.list()).thenReturn(new GenericKubernetesResourceList());
-        when(genericOperation.resource(any(GenericKubernetesResource.class))).thenReturn(genericResource);
-
-        engine.triggerWorkflow(tf);
-
-        verify(genericOperation).resource(resourceCaptor.capture());
-        GenericKubernetesResource created = resourceCaptor.getValue();
-
-        Map<String, String> labels = created.getMetadata().getLabels();
-        assertEquals("platform", labels.get("team"));
-        assertEquals("testflight-operator", labels.get("app.kubernetes.io/managed-by"));
-
-        Map<String, String> annotations = created.getMetadata().getAnnotations();
-        assertEquals("CI run", annotations.get("description"));
-    }
-
-    @Test
-    @DisplayName("Should return starting status when workflow status is missing")
-    void testStatusMissingStatusObject() {
-        TestFlight tf = createTestFlight("no-status");
-        setupGenericMocks();
-
-        GenericKubernetesResource workflow = new GenericKubernetesResource();
-        workflow.setAdditionalProperties(Map.of()); // No "status" field
-        when(genericOperation.list()).thenReturn(createList(workflow));
-
-        WorkflowEngine.WorkflowStatus status = engine.getWorkflowStatus(tf);
-
-        assertNotNull(status);
-        assertFalse(status.isComplete());
-        assertTrue(status.message().contains("starting"));
-    }
-
-    @Test
-    @DisplayName("Should handle unknown phases as running")
-    void testUnknownPhase() {
-        TestFlight tf = createTestFlight("unknown-phase");
-        setupGenericMocks();
-
-        GenericKubernetesResource workflow = new GenericKubernetesResource();
-        workflow.setAdditionalProperties(Map.of("status", Map.of("phase", "Pending", "message", "Waiting for pod")));
-        when(genericOperation.list()).thenReturn(createList(workflow));
-
-        WorkflowEngine.WorkflowStatus status = engine.getWorkflowStatus(tf);
-
-        assertNotNull(status);
-        assertFalse(status.isComplete());
-        assertTrue(status.message().contains("Pending"));
-    }
-
-    @Test
-    @DisplayName("Should handle Succeeded phase")
-    void testStatusSucceeded() {
-        TestFlight tf = createTestFlight("succeeded-tf");
-        setupGenericMocks();
-
-        GenericKubernetesResource workflow = new GenericKubernetesResource();
-        workflow.setAdditionalProperties(Map.of("status", Map.of("phase", "Succeeded", "message", "Done")));
-        when(genericOperation.list()).thenReturn(createList(workflow));
-
-        WorkflowEngine.WorkflowStatus status = engine.getWorkflowStatus(tf);
-
-        assertNotNull(status);
-        assertTrue(status.isComplete());
-        assertTrue(status.isSucceeded());
-    }
-
-    @Test
-    @DisplayName("Should handle Failed phase")
-    void testStatusFailed() {
-        TestFlight tf = createTestFlight("failed-tf");
-        setupGenericMocks();
-
-        GenericKubernetesResource workflow = new GenericKubernetesResource();
-        workflow.setAdditionalProperties(Map.of("status", Map.of("phase", "Failed", "message", "Oh no")));
-        when(genericOperation.list()).thenReturn(createList(workflow));
-
-        WorkflowEngine.WorkflowStatus status = engine.getWorkflowStatus(tf);
-
-        assertNotNull(status);
-        assertTrue(status.isComplete());
-        assertFalse(status.isSucceeded());
-    }
-
-    @Test
-    @DisplayName("Should return true when cancelling non-existent workflow")
-    void testCancelNotFound() {
-        TestFlight tf = createTestFlight("cancel-missing");
-        setupGenericMocks();
-        when(genericOperation.list()).thenReturn(new GenericKubernetesResourceList());
-
-        boolean result = engine.cancelWorkflow(tf);
-
-        assertTrue(result);
-        verify(genericOperation, never()).resource(any(GenericKubernetesResource.class));
-    }
-
-    @Test
-    @DisplayName("Should handle Error phase as failure")
-    void testStatusError() {
-        TestFlight tf = createTestFlight("error-tf");
-        setupGenericMocks();
-
-        GenericKubernetesResource workflow = new GenericKubernetesResource();
-        workflow.setAdditionalProperties(Map.of("status", Map.of("phase", "Error", "message", "Something broke")));
-        when(genericOperation.list()).thenReturn(createList(workflow));
-
-        WorkflowEngine.WorkflowStatus status = engine.getWorkflowStatus(tf);
-
-        assertNotNull(status);
-        assertTrue(status.isComplete());
-        assertFalse(status.isSucceeded());
-    }
-
-    @Test
-    @DisplayName("Should create spec map if null when cancelling")
-    void testCancelWithNullSpec() {
-        TestFlight tf = createTestFlight("cancel-null-spec");
-        setupGenericMocks();
-
-        GenericKubernetesResource workflow = new GenericKubernetesResource();
-        workflow.setMetadata(new ObjectMeta());
-        workflow.getMetadata().setName("wf-2");
-        // Use mutable map but with no "spec" key
-        java.util.Map<String, Object> props = new java.util.HashMap<>();
-        workflow.setAdditionalProperties(props);
-
-        when(genericOperation.list())
-                .thenReturn(createList(workflow))
-                .thenReturn(new GenericKubernetesResourceList());
-        when(genericOperation.resource(any(GenericKubernetesResource.class))).thenReturn(genericResource);
-
-        boolean result = engine.cancelWorkflow(tf);
-
-        assertTrue(result);
-        verify(genericOperation).resource(resourceCaptor.capture());
-        GenericKubernetesResource patched = resourceCaptor.getValue();
-
-        @SuppressWarnings("unchecked")
-        Map<String, Object> spec = (Map<String, Object>) patched.getAdditionalProperties().get("spec");
-        assertNotNull(spec);
-        assertEquals("Terminate", spec.get("shutdown"));
-    }
-
-    @Test
-    @DisplayName("Should return false for blank template name")
-    void testBlankTemplateName() {
-        TestFlight tf = createTestFlight("blank-template");
-        WorkflowConfig config = new WorkflowConfig();
-        config.setTemplateName("   "); // Blank, not null
-        tf.getSpec().setWorkflow(config);
-
-        boolean result = engine.triggerWorkflow(tf);
-
-        assertFalse(result);
-    }
-
-    @Test
-    @DisplayName("Should handle default phase in switch")
-    void testDefaultPhase() {
-        TestFlight tf = createTestFlight("default-phase");
-        setupGenericMocks();
-
-        GenericKubernetesResource workflow = new GenericKubernetesResource();
-        workflow.setAdditionalProperties(Map.of("status", Map.of("phase", "Pending", "message", "initializing")));
-        when(genericOperation.list()).thenReturn(createList(workflow));
-
-        WorkflowEngine.WorkflowStatus status = engine.getWorkflowStatus(tf);
-
-        assertNotNull(status);
-        assertFalse(status.isComplete());
-        assertTrue(status.message().contains("Pending"));
-    }
-
-}
+{{- end }}
