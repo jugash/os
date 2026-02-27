@@ -1,268 +1,470 @@
-#!/usr/bin/env python3
-
-import os
-import requests
-import argparse
-import logging
-import sys
-import time
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-def get_dr_replication_status(url, token):
-    headers = {"X-Vault-Token": token}
-    try:
-        r = requests.get(f"{url}/v1/sys/replication/dr/status", headers=headers)
-        r.raise_for_status()
-        return r.json()
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Failed to get DR replication status from {url}: {e}")
-        return None
-
-def promote_dr_secondary(url, token):
-    headers = {"X-Vault-Token": token}
-    try:
-        r = requests.post(f"{url}/v1/sys/replication/dr/secondary/promote", headers=headers)
-        r.raise_for_status()
-        return True
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Failed to promote DR secondary {url}: {e}")
-        return False
-
-def demote_dr_primary(url, token):
-    headers = {"X-Vault-Token": token}
-    try:
-        r = requests.post(f"{url}/v1/sys/replication/dr/primary/demote", headers=headers)
-        r.raise_for_status()
-        return True
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Failed to demote DR primary {url}: {e}")
-        return False
-
-def generate_dr_secondary_token(url, token):
-    headers = {"X-Vault-Token": token}
-    try:
-        r = requests.post(f"{url}/v1/sys/replication/dr/secondary/generate-token", headers=headers)
-        r.raise_for_status()
-        return r.json()['data']['token']
-    except (requests.exceptions.RequestException, KeyError) as e:
-        logging.error(f"Failed to generate DR secondary token from {url}: {e}")
-        return None
-
-def enable_dr_replication(url, token, primary_token):
-    headers = {"X-Vault-Token": token}
-    payload = {"token": primary_token}
-    try:
-        r = requests.post(f"{url}/v1/sys/replication/dr/secondary/enable", headers=headers, json=payload)
-        r.raise_for_status()
-        return True
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Failed to enable DR replication on {url}: {e}")
-        return False
-
-def get_performance_replication_status(url, token):
-    headers = {"X-Vault-Token": token}
-    try:
-        r = requests.get(f"{url}/v1/sys/replication/performance/status", headers=headers)
-        r.raise_for_status()
-        return r.json()
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Failed to get performance replication status from {url}: {e}")
-        return None
-
-def disable_performance_replication(url, token):
-    headers = {"X-Vault-Token": token}
-    try:
-        r = requests.post(f"{url}/v1/sys/replication/performance/disable", headers=headers)
-        r.raise_for_status()
-        return True
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Failed to disable performance replication on {url}: {e}")
-        return False
-
-def generate_performance_secondary_token(url, token):
-    headers = {"X-Vault-Token": token}
-    try:
-        r = requests.post(f"{url}/v1/sys/replication/performance/secondary/generate-token", headers=headers)
-        r.raise_for_status()
-        return r.json()['data']['token']
-    except (requests.exceptions.RequestException, KeyError) as e:
-        logging.error(f"Failed to generate performance secondary token from {url}: {e}")
-        return None
-
-def enable_performance_replication(url, token, primary_token):
-    headers = {"X-Vault-Token": token}
-    payload = {"token": primary_token}
-    try:
-        r = requests.post(f"{url}/v1/sys/replication/performance/secondary/enable", headers=headers, json=payload)
-        r.raise_for_status()
-        return True
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Failed to enable performance replication on {url}: {e}")
-        return False
-
-def switch_primary(new_primary, old_primary, all_perf_replicas, dry_run=False, resilient=False):
-    """
-    Switches the primary cluster and re-parents all performance replicas to the new primary.
-    """
-    new_primary_url, new_primary_token = new_primary['url'], new_primary['token']
-    old_primary_url, old_primary_token = old_primary['url'], old_primary['token']
-
-    if dry_run:
-        logging.info(f"DRY-RUN: Promoting {new_primary_url} to primary.")
-        for replica in all_perf_replicas:
-            logging.info(f"DRY-RUN: Re-parenting {replica['url']} to new primary.")
-        logging.info(f"DRY-RUN: Demoting {old_primary_url} to be a DR secondary.")
-        return True
-
-    # --- Step 1: Demote (if planned) or Promote (if disaster) ---
-    if resilient:
-        logging.info(f"Promoting {new_primary_url} to primary...")
-        if not promote_dr_secondary(new_primary_url, new_primary_token) or not verify_cluster_state(new_primary_url, new_primary_token, "primary"): return False
-    else:
-        logging.info(f"Graceful switchover: Demoting current primary {old_primary_url} first...")
-        if not demote_dr_primary(old_primary_url, old_primary_token) or not verify_cluster_state(old_primary_url, old_primary_token, "secondary"): return False
-        logging.info(f"Promoting {new_primary_url} to primary...")
-        if not promote_dr_secondary(new_primary_url, new_primary_token) or not verify_cluster_state(new_primary_url, new_primary_token, "primary"): return False
-    
-    # --- Step 2: Reconfigure ALL Performance Replicas ---
-    logging.info("Reconfiguring all performance replicas to point to the new primary...")
-    for replica in all_perf_replicas:
-        replica_url, replica_token = replica['url'], replica['token']
-        if not disable_performance_replication(replica_url, replica_token):
-            if resilient: 
-                logging.warning(f"Could not disable replication on {replica_url}. Skipping.")
-                continue
-            else: return False
-        
-        primary_token = generate_performance_secondary_token(new_primary_url, new_primary_token)
-        if not primary_token or not enable_performance_replication(replica_url, replica_token, primary_token):
-            if resilient: logging.warning(f"Could not re-enable replication on {replica_url}. Manual intervention may be required.")
-            else: return False
-
-    # --- Step 3: Re-configure old primary as a new DR secondary ---
-    logging.info(f"Configuring old primary {old_primary_url} as a DR secondary...")
-    if resilient and not demote_dr_primary(old_primary_url, old_primary_token):
-        logging.warning(f"Could not demote old primary at {old_primary_url}. It may already be down.")
-
-    primary_token = generate_dr_secondary_token(new_primary_url, new_primary_token)
-    if not primary_token: return False
-
-    if not enable_dr_replication(old_primary_url, old_primary_token, primary_token):
-        if resilient: logging.warning(f"Could not enable DR replication on {old_primary_url}. Manual intervention may be required.")
-        else: return False
-
-    logging.info("Switchover complete.")
-    return True
-
-def verify_cluster_state(url, token, expected_mode, timeout=60):
-    start_time = time.time()
-    while time.time() - start_time < timeout:
-        status = get_dr_replication_status(url, token)
-        if status and status.get('data', {}).get('mode') == expected_mode:
-            logging.info(f"Cluster {url} successfully transitioned to '{expected_mode}' mode.")
-            return True
-        time.sleep(5)
-    logging.error(f"Cluster {url} failed to transition to '{expected_mode}' mode within {timeout}s.")
-    return False
-
-def preflight_checks(clients):
-    for name, client in clients.items():
-        url, token = client['url'], client['token']
-        headers = {"X-Vault-Token": token}
-        try:
-            r = requests.get(f"{url}/v1/sys/health", headers=headers)
-            r.raise_for_status()
-            if r.json().get('initialized') and not r.json().get('sealed'):
-                logging.info(f"Preflight check passed: Successfully connected to {name} at {url}")
-            else:
-                logging.error(f"Preflight check failed: Cluster {name} at {url} is not initialized or is sealed.")
-                return False
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Preflight check failed: Unable to connect to {name} at {url}: {e}")
-            return False
-    return True
-
-def get_client(url, token):
-    """Helper to create a client dictionary."""
-    return {'url': url, 'token': token}
-
-def main():
-    """
-    Main function to handle failover and failback.
-    """
-    parser = argparse.ArgumentParser(description="Vault Enterprise Failover and Failback Script")
-    parser.add_argument("command", choices=["status", "failover", "failback"], help="The command to execute")
-    parser.add_argument("--dry-run", action="store_true", help="Print the sequence of actions without executing them")
-    args = parser.parse_args()
-
-    # --- Configuration ---
-    env_vars = {
-        "dc1_cluster_addr": "DC1_CLUSTER_ADDR", "dc1_cluster_token": "DC1_CLUSTER_TOKEN",
-        "dc1_perf_addr": "DC1_PERF_REPLICA_ADDR", "dc1_perf_token": "DC1_PERF_REPLICA_TOKEN",
-        "dc2_cluster_addr": "DC2_CLUSTER_ADDR", "dc2_cluster_token": "DC2_CLUSTER_TOKEN",
-        "dc2_perf_addr": "DC2_PERF_REPLICA_ADDR", "dc2_perf_token": "DC2_PERF_REPLICA_TOKEN",
-    }
-    config = {key: os.environ.get(val) for key, val in env_vars.items()}
-    if not all(config.values()):
-        logging.error(f"Missing one or more required environment variables: {list(env_vars.values())}")
-        sys.exit(1)
-
-    clients = {
-        "DC1 Cluster": get_client(config["dc1_cluster_addr"], config["dc1_cluster_token"]),
-        "DC1 Perf Replica": get_client(config["dc1_perf_addr"], config["dc1_perf_token"]),
-        "DC2 Cluster": get_client(config["dc2_cluster_addr"], config["dc2_cluster_token"]),
-        "DC2 Perf Replica": get_client(config["dc2_perf_addr"], config["dc2_perf_token"]),
-    }
-
-    if not args.dry_run and not preflight_checks(clients):
-        sys.exit(1)
-
-    # --- Dynamic Role Detection ---
-    primary_client, secondary_client = None, None
-    dc1_status = get_dr_replication_status(clients["DC1 Cluster"]["url"], clients["DC1 Cluster"]["token"])
-    dc2_status = get_dr_replication_status(clients["DC2 Cluster"]["url"], clients["DC2 Cluster"]["token"])
-
-    if dc1_status and dc1_status.get('data', {}).get('mode') == 'primary':
-        primary_client = clients["DC1 Cluster"]
-        secondary_client = clients["DC2 Cluster"]
-    elif dc2_status and dc2_status.get('data', {}).get('mode') == 'primary':
-        primary_client = clients["DC2 Cluster"]
-        secondary_client = clients["DC1 Cluster"]
-    
-    if not primary_client or not secondary_client:
-        logging.error("Could not determine primary and secondary clusters. Please check their status.")
-        sys.exit(1)
-
-    logging.info(f"Detected Primary: {primary_client['url']}")
-    logging.info(f"Detected Secondary: {secondary_client['url']}")
-
-    # --- Command Execution ---
-    if args.command == "status":
-        for name, client in clients.items():
-            dr_status = get_dr_replication_status(client["url"], client["token"])
-            perf_status = get_performance_replication_status(client["url"], client["token"])
-            dr_mode = dr_status.get('data', {}).get('mode', 'N/A') if dr_status else 'N/A'
-            perf_mode = perf_status.get('data', {}).get('mode', 'N/A') if perf_status else 'N/A'
-            logging.info(f"Status for {name}: DR Mode='{dr_mode}', Performance Mode='{perf_mode}'")
-
-    elif args.command == "failover":
-        logging.info(f"Attempting resilient failover to {secondary_client['url']}...")
-        if not switch_primary(
-            new_primary_client=secondary_client, old_primary_client=primary_client,
-            all_perf_replicas=[clients["DC1 Perf Replica"], clients["DC2 Perf Replica"]],
-            dry_run=args.dry_run, resilient=True
-        ):
-            sys.exit(1)
-
-    elif args.command == "failback":
-        logging.info(f"Attempting planned failback to {secondary_client['url']}...")
-        if not switch_primary(
-            new_primary_client=secondary_client, old_primary_client=primary_client,
-            all_perf_replicas=[clients["DC1 Perf Replica"], clients["DC2 Perf Replica"]],
-            dry_run=args.dry_run, resilient=False
-        ):
-            sys.exit(1)
-
-if __name__ == "__main__":
-    main()
+diff --git a/k8s-hardware-device-plugin/charts/hardware-device-plugin/templates/daemonset.yaml b/k8s-hardware-device-plugin/charts/hardware-device-plugin/templates/daemonset.yaml
+index 5535710..88ca320 100644
+--- a/k8s-hardware-device-plugin/charts/hardware-device-plugin/templates/daemonset.yaml
++++ b/k8s-hardware-device-plugin/charts/hardware-device-plugin/templates/daemonset.yaml
+@@ -95,6 +95,16 @@ spec:
+               value: {{ .Values.plugin.cpu.resourceName | quote }}
+             - name: SOLARFLARE_RESOURCE_NAME
+               value: {{ .Values.plugin.solarflare.resourceName | quote }}
++            {{- if .Values.metrics.enabled }}
++            - name: METRICS_PORT
++              value: {{ .Values.metrics.port | quote }}
++            {{- end }}
++
++          {{- if .Values.metrics.enabled }}
++          ports:
++            - name: metrics
++              containerPort: {{ .Values.metrics.port }}
++          {{- end }}
+ 
+           resources:
+             {{- toYaml .Values.resources | nindent 12 }}
+@@ -115,8 +125,13 @@ spec:
+             - name: host-dev
+               mountPath: /dev
+ 
+-          # Liveness probe: verify the plugin's gRPC socket files exist
++          # Liveness probe: verify the gRPC sockets exist, or use HTTP healthz if metrics enabled
+           livenessProbe:
++            {{- if .Values.metrics.enabled }}
++            httpGet:
++              path: /healthz
++              port: metrics
++            {{- else }}
+             exec:
+               command:
+                 - sh
+@@ -124,10 +139,22 @@ spec:
+                 - |
+                   test -S {{ .Values.hostPaths.devicePluginDir }}/isolated-cpu.sock &&
+                   test -S {{ .Values.hostPaths.devicePluginDir }}/solarflare-onload.sock
++            {{- end }}
+             initialDelaySeconds: 15
+             periodSeconds: 30
+             failureThreshold: 3
+ 
++          {{- if .Values.metrics.enabled }}
++          # Readiness probe: verifies both plugins have successfully registered with the kubelet
++          readinessProbe:
++            httpGet:
++              path: /readyz
++              port: metrics
++            initialDelaySeconds: 5
++            periodSeconds: 10
++            failureThreshold: 1
++          {{- end }}
++
+       # ── Volumes ───────────────────────────────────────────────────────────
+       volumes:
+         - name: device-plugin-dir
+diff --git a/k8s-hardware-device-plugin/charts/hardware-device-plugin/templates/servicemonitor.yaml b/k8s-hardware-device-plugin/charts/hardware-device-plugin/templates/servicemonitor.yaml
+new file mode 100644
+index 0000000..ac6ea22
+--- /dev/null
++++ b/k8s-hardware-device-plugin/charts/hardware-device-plugin/templates/servicemonitor.yaml
+@@ -0,0 +1,16 @@
++{{- if and .Values.metrics.enabled .Values.metrics.serviceMonitor.enabled }}
++apiVersion: monitoring.coreos.com/v1
++kind: ServiceMonitor
++metadata:
++  name: {{ include "hardware-device-plugin.fullname" . }}
++  namespace: {{ .Release.Namespace }}
++  labels:
++    {{- include "hardware-device-plugin.labels" . | nindent 4 }}
++spec:
++  selector:
++    matchLabels:
++      {{- include "hardware-device-plugin.selectorLabels" . | nindent 6 }}
++  endpoints:
++    - port: metrics
++      interval: 15s
++{{- end }}
+diff --git a/k8s-hardware-device-plugin/charts/hardware-device-plugin/values.yaml b/k8s-hardware-device-plugin/charts/hardware-device-plugin/values.yaml
+index 60b799b..330dc41 100644
+--- a/k8s-hardware-device-plugin/charts/hardware-device-plugin/values.yaml
++++ b/k8s-hardware-device-plugin/charts/hardware-device-plugin/values.yaml
+@@ -63,6 +63,13 @@ resources:
+     cpu: "200m"
+     memory: "128Mi"
+ 
++# ── Metrics ───────────────────────────────────────────────────────────────────
++metrics:
++  enabled: true
++  port: 8080
++  serviceMonitor:
++    enabled: false  # Set true to create a Prometheus ServiceMonitor resource
++
+ # ── RBAC ──────────────────────────────────────────────────────────────────────
+ serviceAccount:
+   create: true
+diff --git a/k8s-hardware-device-plugin/pyproject.toml b/k8s-hardware-device-plugin/pyproject.toml
+index eb29183..ff3a907 100644
+--- a/k8s-hardware-device-plugin/pyproject.toml
++++ b/k8s-hardware-device-plugin/pyproject.toml
+@@ -2,3 +2,6 @@
+ testpaths = ["tests"]
+ pythonpath = ["src"]
+ addopts = "-v --tb=short"
++
++[project.optional-dependencies]
++metrics = ["prometheus-client>=0.20"]
+diff --git a/k8s-hardware-device-plugin/src/cpu/plugin.py b/k8s-hardware-device-plugin/src/cpu/plugin.py
+index 965791b..ecc76ac 100644
+--- a/k8s-hardware-device-plugin/src/cpu/plugin.py
++++ b/k8s-hardware-device-plugin/src/cpu/plugin.py
+@@ -29,8 +29,6 @@ from typing import Dict, Iterator, List, Optional
+ 
+ import grpc
+ 
+-# Proto stubs are generated at container build time into src/proto/
+-# (see Dockerfile: python -m grpc_tools.protoc ...)
+ from proto import api_pb2, api_pb2_grpc
+ from cpu.discovery import discover_isolated_cpus
+ from cpu.numa import (
+@@ -38,6 +36,7 @@ from cpu.numa import (
+     build_cpu_to_node_map,
+     select_preferred_cpus,
+ )
++import metrics as _metrics
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -88,7 +87,12 @@ class CPUDevicePlugin(api_pb2_grpc.DevicePluginServicer):
+ 
+     def _refresh_devices(self) -> None:
+         """Re-scan isolated CPUs and NUMA topology; update the internal device table."""
++        import time
++        t0 = time.monotonic()
+         cpu_ids: List[int] = discover_isolated_cpus()
++        _metrics.device_refresh_duration_seconds.labels(plugin="cpu").observe(
++            time.monotonic() - t0
++        )
+ 
+         # Refresh NUMA topology (changes are extremely rare but handle them)
+         topology = discover_numa_topology()
+@@ -109,6 +113,10 @@ class CPUDevicePlugin(api_pb2_grpc.DevicePluginServicer):
+             self._devices = new_devices
+             self._cpu_to_node = cpu_to_node
+ 
++        # Update Prometheus metrics
++        _metrics.devices_total.labels(plugin="cpu", health="Healthy").set(len(new_devices))
++        _metrics.devices_total.labels(plugin="cpu", health="Unhealthy").set(0)
++
+         if changed:
+             log.info(
+                 "CPU plugin: device list updated – %d isolated CPU(s): %s",
+@@ -273,6 +281,7 @@ class CPUDevicePlugin(api_pb2_grpc.DevicePluginServicer):
+                     }
+                 )
+             )
++            _metrics.allocations_total.labels(plugin="cpu").inc()
+ 
+         return api_pb2.AllocateResponse(container_responses=container_responses)
+ 
+@@ -317,6 +326,7 @@ class CPUDevicePlugin(api_pb2_grpc.DevicePluginServicer):
+         log.info(
+             "CPU plugin: registered resource '%s' with kubelet", RESOURCE_NAME
+         )
++        _metrics.set_registered("cpu")
+ 
+     def stop(self) -> None:
+         """Signal the plugin to stop and shut down the gRPC server."""
+diff --git a/k8s-hardware-device-plugin/src/main.py b/k8s-hardware-device-plugin/src/main.py
+index c9b997a..dab445a 100644
+--- a/k8s-hardware-device-plugin/src/main.py
++++ b/k8s-hardware-device-plugin/src/main.py
+@@ -35,6 +35,7 @@ if _SRC_DIR not in sys.path:
+ 
+ from cpu.plugin import CPUDevicePlugin
+ from solarflare.plugin import SolarflareDevicePlugin
++import metrics as _metrics
+ 
+ # ── Logging setup ─────────────────────────────────────────────────────────────
+ LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+@@ -140,6 +141,10 @@ def run() -> None:
+ 
+     plugins = [cpu_plugin, sf_plugin]
+ 
++    # ── Start metrics server ──────────────────────────────────────────────────
++    metrics_port = int(os.environ.get("METRICS_PORT", "8080"))
++    _metrics.start_metrics_server(port=metrics_port)
++
+     # ── Graceful shutdown via SIGTERM / SIGINT ───────────────────────────────
+     stop_flag = threading.Event()
+ 
+@@ -185,6 +190,11 @@ def run() -> None:
+                 current_mtime,
+             )
+             last_mtime = current_mtime
++            
++            # Kubelet restart clears previous registrations
++            for p_name in ("cpu", "onload"):
++                _metrics.set_unregistered(p_name)
++
+             for plugin in plugins:
+                 try:
+                     plugin.register()
+diff --git a/k8s-hardware-device-plugin/src/metrics.py b/k8s-hardware-device-plugin/src/metrics.py
+new file mode 100644
+index 0000000..1e9f609
+--- /dev/null
++++ b/k8s-hardware-device-plugin/src/metrics.py
+@@ -0,0 +1,179 @@
++"""
++Observability module – Prometheus metrics + health endpoints
++=============================================================
++Exposes a single HTTP server (default port 8080) with three endpoints:
++
++  /metrics   – Prometheus text format scrape endpoint
++  /healthz   – liveness  probe  (200 when the process is alive)
++  /readyz    – readiness probe  (200 when both plugins are registered)
++
++Usage
++-----
++Call ``start_metrics_server()`` once from main.py before starting plugins.
++Each plugin calls the metric helpers (record_refresh, record_allocate, …)
++from its own methods to update counters and gauges.
++
++All metric names are prefixed with ``lola_`` so they are easy to filter
++in Prometheus / Grafana:
++
++  lola_devices_total{plugin, health}           Gauge
++  lola_onload_available                        Gauge   (1/0)
++  lola_plugin_registered{plugin}               Gauge   (1/0)
++  lola_allocations_total{plugin}               Counter
++  lola_allocation_errors_total{plugin}         Counter
++  lola_device_refresh_duration_seconds{plugin} Histogram
++"""
++
++import logging
++import threading
++from http.server import BaseHTTPRequestHandler, HTTPServer
++from typing import Optional
++
++from prometheus_client import (
++    CollectorRegistry,
++    Counter,
++    Gauge,
++    Histogram,
++    generate_latest,
++    CONTENT_TYPE_LATEST,
++    REGISTRY,
++)
++
++log = logging.getLogger(__name__)
++
++# ── Metric definitions ────────────────────────────────────────────────────────
++# All metrics use the default REGISTRY so prometheus_client's built-in process
++# and GC collectors are also exported automatically.
++
++devices_total = Gauge(
++    "lola_devices_total",
++    "Number of devices by plugin and health state",
++    ["plugin", "health"],
++)
++
++onload_available = Gauge(
++    "lola_onload_available",
++    "1 if /dev/onload is present on this node, 0 otherwise",
++)
++
++plugin_registered = Gauge(
++    "lola_plugin_registered",
++    "1 if the plugin is currently registered with the kubelet, 0 otherwise",
++    ["plugin"],
++)
++
++allocations_total = Counter(
++    "lola_allocations_total",
++    "Total number of successful Allocate() calls handled",
++    ["plugin"],
++)
++
++allocation_errors_total = Counter(
++    "lola_allocation_errors_total",
++    "Total number of failed Allocate() calls (device not found or gRPC error)",
++    ["plugin"],
++)
++
++device_refresh_duration_seconds = Histogram(
++    "lola_device_refresh_duration_seconds",
++    "Wall-clock time spent re-scanning for devices",
++    ["plugin"],
++    buckets=(0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0),
++)
++
++# Initialise label combinations to 0 so Prometheus never sees missing series
++for _plugin in ("cpu", "onload"):
++    allocations_total.labels(plugin=_plugin)
++    allocation_errors_total.labels(plugin=_plugin)
++    plugin_registered.labels(plugin=_plugin).set(0)
++    for _health in ("Healthy", "Unhealthy"):
++        devices_total.labels(plugin=_plugin, health=_health).set(0)
++
++onload_available.set(0)
++
++
++# ── Readiness state ───────────────────────────────────────────────────────────
++# Both plugins call set_registered() after a successful Register() RPC.
++# /readyz returns 200 only when both have registered at least once.
++
++_registered: set = set()
++_registered_lock = threading.Lock()
++
++
++def set_registered(plugin: str) -> None:
++    """Mark a plugin as registered with the kubelet."""
++    with _registered_lock:
++        _registered.add(plugin)
++    plugin_registered.labels(plugin=plugin).set(1)
++    log.debug("metrics: plugin '%s' marked as registered", plugin)
++
++
++def set_unregistered(plugin: str) -> None:
++    """Mark a plugin as no longer registered (e.g. after kubelet restart)."""
++    with _registered_lock:
++        _registered.discard(plugin)
++    plugin_registered.labels(plugin=plugin).set(0)
++
++
++def _both_registered() -> bool:
++    with _registered_lock:
++        return {"cpu", "onload"}.issubset(_registered)
++
++
++# ── HTTP handler ──────────────────────────────────────────────────────────────
++
++class _MetricsHandler(BaseHTTPRequestHandler):
++    """Minimal HTTP handler for /metrics, /healthz, /readyz."""
++
++    def do_GET(self) -> None:  # noqa: N802
++        if self.path == "/metrics":
++            data = generate_latest(REGISTRY)
++            self._respond(200, CONTENT_TYPE_LATEST, data)
++
++        elif self.path == "/healthz":
++            # Process is alive → always 200
++            self._respond(200, "text/plain", b"ok\n")
++
++        elif self.path == "/readyz":
++            if _both_registered():
++                self._respond(200, "text/plain", b"ok\n")
++            else:
++                with _registered_lock:
++                    missing = {"cpu", "onload"} - _registered
++                body = f"not ready: {sorted(missing)} not registered\n".encode()
++                self._respond(503, "text/plain", body)
++
++        else:
++            self._respond(404, "text/plain", b"not found\n")
++
++    def _respond(self, code: int, content_type: str, body: bytes) -> None:
++        self.send_response(code)
++        self.send_header("Content-Type", content_type)
++        self.send_header("Content-Length", str(len(body)))
++        self.end_headers()
++        self.wfile.write(body)
++
++    def log_message(self, fmt, *args) -> None:  # suppress default access log
++        pass
++
++
++# ── Server startup ────────────────────────────────────────────────────────────
++
++_server: Optional[HTTPServer] = None
++
++
++def start_metrics_server(port: int = 8080) -> None:
++    """
++    Start the metrics HTTP server in a daemon thread.
++
++    Safe to call multiple times – subsequent calls are no-ops.
++    """
++    global _server
++    if _server is not None:
++        return
++
++    _server = HTTPServer(("", port), _MetricsHandler)
++    thread = threading.Thread(target=_server.serve_forever, daemon=True,
++                              name="metrics-http")
++    thread.start()
++    log.info("Metrics server listening on :%d  (/metrics /healthz /readyz)", port)
+diff --git a/k8s-hardware-device-plugin/src/solarflare/plugin.py b/k8s-hardware-device-plugin/src/solarflare/plugin.py
+index d5942df..f826d22 100644
+--- a/k8s-hardware-device-plugin/src/solarflare/plugin.py
++++ b/k8s-hardware-device-plugin/src/solarflare/plugin.py
+@@ -50,6 +50,7 @@ from solarflare.discovery import (
+     discover_solarflare_devices,
+     get_host_device_paths,
+ )
++import metrics as _metrics
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -93,7 +94,12 @@ class SolarflareDevicePlugin(api_pb2_grpc.DevicePluginServicer):
+ 
+     def _refresh_devices(self) -> None:
+         """Re-scan for Solarflare NICs and update the internal device table."""
++        import time
++        t0 = time.monotonic()
+         found: List[SolarflareDevice] = discover_solarflare_devices()
++        _metrics.device_refresh_duration_seconds.labels(plugin="onload").observe(
++            time.monotonic() - t0
++        )
+ 
+         new_devices: dict = {}
+         for dev in found:
+@@ -144,6 +150,12 @@ class SolarflareDevicePlugin(api_pb2_grpc.DevicePluginServicer):
+                     healthy, len(new_devices), ONLOAD_DEV_PATH,
+                 )
+ 
++        # Update Prometheus metrics
++        healthy_count = sum(1 for d in new_devices.values() if d.is_healthy)
++        _metrics.devices_total.labels(plugin="onload", health="Healthy").set(healthy_count)
++        _metrics.devices_total.labels(plugin="onload", health="Unhealthy").set(len(new_devices) - healthy_count)
++        _metrics.onload_available.set(1 if os.path.exists(ONLOAD_DEV_PATH) else 0)
++
+     def _get_pb_devices(self) -> List[api_pb2.Device]:
+         """Thread-safe snapshot of current devices as protobuf objects.
+ 
+@@ -252,6 +264,7 @@ class SolarflareDevicePlugin(api_pb2_grpc.DevicePluginServicer):
+                 # We cannot set a gRPC error and also return partial responses, so:
+                 context.set_code(grpc.StatusCode.NOT_FOUND)
+                 context.set_details(f"Device '{allocated_id}' not found")
++                _metrics.allocation_errors_total.labels(plugin="onload").inc()
+                 return api_pb2.AllocateResponse(container_responses=container_responses)
+ 
+             log.info(
+@@ -310,6 +323,7 @@ class SolarflareDevicePlugin(api_pb2_grpc.DevicePluginServicer):
+                     devices=device_specs,
+                 )
+             )
++            _metrics.allocations_total.labels(plugin="onload").inc()
+ 
+         return api_pb2.AllocateResponse(container_responses=container_responses)
+ 
+@@ -365,6 +379,7 @@ class SolarflareDevicePlugin(api_pb2_grpc.DevicePluginServicer):
+         log.info(
+             "Solarflare plugin: registered resource '%s' with kubelet", RESOURCE_NAME
+         )
++        _metrics.set_registered("onload")
+ 
+     def stop(self) -> None:
+         """Signal stop and shutdown the gRPC server."""
+diff --git a/k8s-hardware-device-plugin/tests/test_cpu_discovery.py b/k8s-hardware-device-plugin/tests/test_cpu_discovery.py
+index eb581ea..195d004 100644
+--- a/k8s-hardware-device-plugin/tests/test_cpu_discovery.py
++++ b/k8s-hardware-device-plugin/tests/test_cpu_discovery.py
+@@ -146,6 +146,8 @@ class TestDiscoverIsolatedCpus:
+         """
+         Dual-socket server: node 0 has CPUs 0-23, node 1 has CPUs 24-47.
+         Isolated CPUs span both NUMA nodes.
++        Discovery only parses the isolcpus string; it has no concept of
++        NUMA nodes, physical cores, or hyperthreading siblings.
+         """
+         (cpu_sysfs / "isolated").write_text("2-5,26-29")
+         monkeypatch.setattr(disc, "ISOLATED_CPU_SYSFS", str(cpu_sysfs / "isolated"))
+@@ -153,20 +155,3 @@ class TestDiscoverIsolatedCpus:
+         result = disc.discover_isolated_cpus()
+         assert result == [2, 3, 4, 5, 26, 27, 28, 29]
+         assert len(result) == 8
